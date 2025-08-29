@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 from pytube import YouTube
+from pytube.exceptions import AgeRestrictedError, VideoUnavailable
 from moviepy.editor import VideoFileClip
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -13,6 +14,8 @@ import requests
 from io import BytesIO
 from collections import deque
 import re
+import urllib.error
+from urllib.parse import urlparse, parse_qs
 
 # Global download manager
 class DownloadManager:
@@ -312,15 +315,56 @@ class YouTubeDownloader:
         if directory:
             self.location_var.set(directory)
     
+    def clean_youtube_url(self, url):
+        """Clean YouTube URL by removing unnecessary parameters"""
+        try:
+            # Parse the URL
+            parsed_url = urlparse(url)
+            
+            # Extract video ID from query parameters
+            query_params = parse_qs(parsed_url.query)
+            video_id = query_params.get('v', [None])[0]
+            
+            # If we found a video ID, reconstruct a clean URL
+            if video_id:
+                return f"https://www.youtube.com/watch?v={video_id}"
+            
+            # If it's a youtu.be short URL
+            if parsed_url.netloc == 'youtu.be':
+                video_id = parsed_url.path[1:]  # Remove the leading slash
+                return f"https://www.youtube.com/watch?v={video_id}"
+                
+            # If we can't extract a clean URL, return the original
+            return url
+            
+        except Exception as e:
+            print(f"Error cleaning URL: {e}")
+            return url
+    
     def get_video_info(self, url):
         try:
+            # Clean the URL first
+            clean_url = self.clean_youtube_url(url)
+            
             # Extract video ID for better thumbnail handling
-            video_id = self.extract_video_id(url)
+            video_id = self.extract_video_id(clean_url)
             if not video_id:
                 raise ValueError("Invalid YouTube URL")
                 
-            yt = YouTube(url)
+            # Use bypass for age-restricted content
+            yt = YouTube(clean_url, use_oauth=False, allow_oauth_cache=True)
             return yt, video_id
+        except AgeRestrictedError:
+            # Try with OAuth for age-restricted content
+            try:
+                yt = YouTube(clean_url, use_oauth=True, allow_oauth_cache=True)
+                return yt, video_id
+            except Exception as e:
+                messagebox.showerror("Error", f"Age-restricted content. Please try with OAuth: {str(e)}")
+                return None, None
+        except VideoUnavailable:
+            messagebox.showerror("Error", "The video is unavailable")
+            return None, None
         except Exception as e:
             messagebox.showerror("Error", f"Failed to get video info: {str(e)}")
             return None, None
@@ -330,7 +374,8 @@ class YouTubeDownloader:
         patterns = [
             r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
             r'(?:embed\/)([0-9A-Za-z_-]{11})',
-            r'(?:shorts\/)([0-9A-Za-z_-]{11})'
+            r'(?:shorts\/)([0-9A-Za-z_-]{11})',
+            r'youtu\.be\/([0-9A-Za-z_-]{11})'
         ]
         
         for pattern in patterns:
@@ -356,19 +401,27 @@ class YouTubeDownloader:
         
         try:
             # Get thumbnail using video ID (more reliable)
-            thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+            # Try different thumbnail qualities with error handling
+            thumbnail_options = [
+                f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+                f"https://i.ytimg.com/vi/{video_id}/default.jpg"
+            ]
             
-            # Try maxres first, if fails try hqdefault
-            try:
-                response = requests.get(thumbnail_url, timeout=10)
-                if response.status_code != 200:
-                    thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-                    response = requests.get(thumbnail_url, timeout=10)
-            except:
-                thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-                response = requests.get(thumbnail_url, timeout=10)
+            img_data = None
+            for thumb_url in thumbnail_options:
+                try:
+                    response = requests.get(thumb_url, timeout=10)
+                    if response.status_code == 200:
+                        img_data = response.content
+                        break
+                except:
+                    continue
             
-            img_data = response.content
+            if not img_data:
+                raise Exception("Could not retrieve thumbnail")
+            
             img = Image.open(BytesIO(img_data))
             img = img.resize((160, 90), Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(img)
@@ -406,8 +459,11 @@ class YouTubeDownloader:
             messagebox.showerror("Error", "Please enter a YouTube URL")
             return
         
+        # Clean the URL first
+        clean_url = self.clean_youtube_url(url)
+        
         # Validate URL
-        video_id = self.extract_video_id(url)
+        video_id = self.extract_video_id(clean_url)
         if not video_id:
             messagebox.showerror("Error", "Invalid YouTube URL")
             return
@@ -418,7 +474,7 @@ class YouTubeDownloader:
             'location': self.location_var.get()
         }
         
-        download_id = download_manager.add_download(url, options)
+        download_id = download_manager.add_download(clean_url, options)
         self.update_download_list()
         self.status_label.configure(text="Download added to queue!")
         
@@ -545,31 +601,54 @@ class YouTubeDownloader:
         try:
             self.status_label.configure(text=f"Downloading: {item['url'][:30]}...")
             
-            yt = YouTube(item['url'], 
-                        on_progress_callback=lambda stream, chunk, bytes_remaining: 
-                        self.on_progress(download_id, stream, chunk, bytes_remaining))
+            # Clean the URL before processing
+            clean_url = self.clean_youtube_url(item['url'])
+            
+            # Try with different parameters for problematic videos
+            try:
+                yt = YouTube(clean_url, 
+                            use_oauth=False,
+                            allow_oauth_cache=True,
+                            on_progress_callback=lambda stream, chunk, bytes_remaining: 
+                            self.on_progress(download_id, stream, chunk, bytes_remaining))
+            except AgeRestrictedError:
+                yt = YouTube(clean_url, 
+                            use_oauth=True,
+                            allow_oauth_cache=True,
+                            on_progress_callback=lambda stream, chunk, bytes_remaining: 
+                            self.on_progress(download_id, stream, chunk, bytes_remaining))
             
             download_path = item['options']['location']
             format_type = item['options']['format']
             
             if format_type == "video":
-                # Download video
-                stream = yt.streams.filter(progressive=True, file_extension='mp4')
+                # Try different stream options
+                stream = None
                 
+                # First try progressive streams
                 if item['options']['quality'] == "highest":
-                    stream = stream.get_highest_resolution()
+                    stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution()
                 elif item['options']['quality'] == "lowest":
-                    stream = stream.get_lowest_resolution()
+                    stream = yt.streams.filter(progressive=True, file_extension='mp4').get_lowest_resolution()
                 else:
-                    stream = stream.filter(res=item['options']['quality']).first()
+                    stream = yt.streams.filter(progressive=True, res=item['options']['quality'], file_extension='mp4').first()
+                
+                # If no progressive stream found, try adaptive
+                if not stream:
+                    if item['options']['quality'] == "highest":
+                        stream = yt.streams.filter(adaptive=True, file_extension='mp4').order_by('resolution').desc().first()
+                    elif item['options']['quality'] == "lowest":
+                        stream = yt.streams.filter(adaptive=True, file_extension='mp4').order_by('resolution').first()
+                    else:
+                        stream = yt.streams.filter(adaptive=True, res=item['options']['quality'], file_extension='mp4').first()
                 
                 if not stream:
-                    raise Exception("No suitable stream found")
+                    raise Exception("No suitable video stream found")
                 
                 output_file = stream.download(output_path=download_path)
                 
             else:
-                # Download audio and convert to MP3
+                # Download audio
                 stream = yt.streams.filter(only_audio=True).first()
                 if not stream:
                     raise Exception("No audio stream found")
@@ -591,11 +670,19 @@ class YouTubeDownloader:
             download_manager.complete_download(download_id, output_file)
             self.status_label.configure(text=f"Download completed: {os.path.basename(output_file)}")
             
+        except AgeRestrictedError:
+            error_msg = "Age-restricted content. Please try again with OAuth authentication."
+            print(f"Download error: {error_msg}")
+            if download_id in download_manager.active_downloads:
+                download_manager.active_downloads[download_id]['status'] = 'error'
+            self.status_label.configure(text=error_msg)
+            
         except Exception as e:
+            error_msg = f"Download failed: {str(e)}"
             print(f"Download error: {e}")
             if download_id in download_manager.active_downloads:
                 download_manager.active_downloads[download_id]['status'] = 'error'
-            self.status_label.configure(text=f"Download failed: {str(e)}")
+            self.status_label.configure(text=error_msg)
         
         finally:
             self.update_download_list()
