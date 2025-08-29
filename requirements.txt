@@ -1,0 +1,6 @@
+pytube==15.0.0
+customtkinter==5.2.1
+moviepy==1.0.3
+pillow==10.1.0
+requests==2.31.0
+packaging
