@@ -14,6 +14,7 @@ import re
 from urllib.parse import urlparse, parse_qs
 from yt_dlp import YoutubeDL
 import shutil
+import vlc
 
 # Global download manager
 class DownloadManager:
@@ -122,6 +123,8 @@ class YouTubeDownloader:
         self.progress_bars = {}
         self.progress_labels = {}
         self.control_buttons = {}
+        self.vlc_instance = vlc.Instance()
+        self.player = None
         
         self.setup_ui()
         self.update_download_list()
@@ -168,7 +171,7 @@ class YouTubeDownloader:
         self.format_var = ctk.StringVar(value="video")
         ctk.CTkRadioButton(format_frame, text="Video (MP4)", variable=self.format_var, 
                           value="video").pack(side="left", padx=10)
-        ctk.CTkRadioButton(format_frame, text="Audio (M4A)", variable=self.format_var, 
+        ctk.CTkRadioButton(format_frame, text="Audio (MP3)", variable=self.format_var, 
                           value="audio").pack(side="left", padx=10)
         
         quality_frame = ctk.CTkFrame(options_frame)
@@ -324,9 +327,9 @@ class YouTubeDownloader:
             return
         yt, video_id = self.get_video_info(url)
         if yt and video_id:
-            self.update_preview(yt, video_id)
+            self.update_preview(yt, video_id, url)
     
-    def update_preview(self, yt, video_id):
+    def update_preview(self, yt, video_id, url):
         for widget in self.preview_frame.winfo_children():
             widget.destroy()
         try:
@@ -364,10 +367,44 @@ class YouTubeDownloader:
                         font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=2)
             ctk.CTkLabel(info_frame, text=f"Duration: {yt.length//60}:{yt.length%60:02d}").pack(anchor="w", pady=2)
             ctk.CTkLabel(info_frame, text=f"Views: {yt.views:,}").pack(anchor="w", pady=2)
+            
+            # Add Play Video button
+            play_button = ctk.CTkButton(info_frame, text="Play Video", 
+                                      command=lambda: self.play_video(url))
+            play_button.pack(anchor="w", pady=5)
+            
+            # Video streaming frame
+            self.video_frame = ctk.CTkFrame(preview_container, width=320, height=180)
+            self.video_frame.pack(side="right", padx=10)
         except Exception as e:
             error_label = ctk.CTkLabel(self.preview_frame, text=f"Preview unavailable: {str(e)}", text_color="red")
             error_label.pack(pady=10)
             print(f"Preview error: {e}")
+    
+    def play_video(self, url):
+        try:
+            if self.player:
+                self.player.stop()
+            stream_url = self.get_stream_url(url)
+            media = self.vlc_instance.media_new(stream_url)
+            self.player = self.vlc_instance.media_player_new()
+            self.player.set_media(media)
+            self.player.set_hwnd(self.video_frame.winfo_id())  # Windows
+            # For macOS/Linux, use set_xwindow instead of set_hwnd
+            # if os.name != 'nt':
+            #     self.player.set_xwindow(self.video_frame.winfo_id())
+            self.player.play()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to play video: {str(e)}")
+    
+    def get_stream_url(self, url):
+        ydl_opts = {
+            'format': 'best',
+            'quiet': True
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info['url']
     
     def add_to_queue(self):
         url = self.url_entry.get().strip()
@@ -573,7 +610,18 @@ class YouTubeDownloader:
                         text="Warning: ffmpeg not found. Using single stream format, quality may be limited.",
                         text_color="yellow"))
             else:
-                ydl_opts['format'] = 'bestaudio[ext=m4a]'
+                ydl_opts['format'] = 'bestaudio'
+                if ffmpeg_available:
+                    ydl_opts['postprocessors'] = [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }]
+                else:
+                    ydl_opts['format'] = 'bestaudio[ext=m4a]'
+                    self.root.after(0, lambda: self.status_label.configure(
+                        text="Warning: ffmpeg not found. Downloading as M4A instead of MP3.",
+                        text_color="yellow"))
             
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(clean_url, download=True)
@@ -589,7 +637,7 @@ class YouTubeDownloader:
             else:
                 error_msg = f"Download failed: {str(e)}"
                 if "ffmpeg is not installed" in str(e):
-                    error_msg = "Download failed: ffmpeg is required for merging video/audio streams. Please install ffmpeg."
+                    error_msg = "Download failed: ffmpeg is required for MP3 conversion or video/audio merging. Please install ffmpeg."
                 print(error_msg)
                 if download_id in download_manager.active_downloads:
                     download_manager.active_downloads[download_id]['status'] = 'error'

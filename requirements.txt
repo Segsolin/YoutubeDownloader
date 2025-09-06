@@ -8,3 +8,4 @@ yt_dlp
 customtkinter 
 pillow 
 requests
+python-vlc
