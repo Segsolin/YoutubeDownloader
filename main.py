@@ -126,10 +126,13 @@ class YouTubeDownloader:
         self.vlc_instance = vlc.Instance()
         self.player = None
         self.is_playing = False
+        self.is_audio_only = False
         self.loading_label = None
         self.loading_frames = []
         self.current_frame = 0
         self.animation_running = False
+        self.thumbnail_photo = None
+        self.size_label = None
         
         self.setup_ui()
         self.update_download_list()
@@ -162,6 +165,7 @@ class YouTubeDownloader:
         self.url_entry = ctk.CTkEntry(url_frame, placeholder_text="Enter YouTube video URL", height=40)
         self.url_entry.pack(fill="x", pady=5)
         self.url_entry.bind("<Return>", lambda e: self.preview_video())
+        self.url_entry.bind("<KeyRelease>", lambda e: self.update_file_size())
         
         self.preview_frame = ctk.CTkFrame(main_frame)
         self.preview_frame.pack(fill="x", padx=20, pady=10)
@@ -175,6 +179,7 @@ class YouTubeDownloader:
         format_frame.pack(fill="x", pady=5)
         
         self.format_var = ctk.StringVar(value="video")
+        self.format_var.trace_add("write", lambda *args: self.update_file_size())
         ctk.CTkRadioButton(format_frame, text="Video (MP4)", variable=self.format_var, 
                           value="video").pack(side="left", padx=10)
         ctk.CTkRadioButton(format_frame, text="Audio (MP3)", variable=self.format_var, 
@@ -185,9 +190,13 @@ class YouTubeDownloader:
         
         ctk.CTkLabel(quality_frame, text="Quality:").pack(side="left")
         self.quality_var = ctk.StringVar(value="highest")
+        self.quality_var.trace_add("write", lambda *args: self.update_file_size())
         quality_combo = ctk.CTkComboBox(quality_frame, variable=self.quality_var,
                                        values=["highest", "2160p", "1440p", "1080p", "720p", "480p", "360p", "lowest"])
         quality_combo.pack(side="left", padx=10)
+        
+        self.size_label = ctk.CTkLabel(options_frame, text="Estimated Size: Unknown")
+        self.size_label.pack(anchor="w", pady=5)
         
         location_frame = ctk.CTkFrame(options_frame)
         location_frame.pack(fill="x", pady=5)
@@ -202,7 +211,8 @@ class YouTubeDownloader:
         self.location_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
         ctk.CTkButton(loc_subframe, text="Browse", width=80, fg_color="#FF9866", 
-                      hover_color="#FFAB80", text_color="#000000", font=ctk.CTkFont(weight="bold")).pack(side="right")
+                      hover_color="#FFAB80", text_color="#000000", font=ctk.CTkFont(weight="bold"),
+                      command=self.browse_location).pack(side="right")
         
         buttons_frame = ctk.CTkFrame(main_frame)
         buttons_frame.pack(fill="x", padx=20, pady=20)
@@ -355,6 +365,7 @@ class YouTubeDownloader:
                     self.title = info.get('title', 'Unknown Title')
                     self.length = int(info.get('duration', 0))
                     self.views = int(info.get('view_count', 0))
+                    self.formats = info.get('formats', [])
             yt = VideoInfo(info)
             return yt, video_id
         except Exception as e:
@@ -374,6 +385,72 @@ class YouTubeDownloader:
                 return match.group(1)
         return None
     
+    def get_file_size(self, url, format_type, quality):
+        try:
+            clean_url = self.clean_youtube_url(url)
+            ydl_opts = {
+                'noplaylist': True,
+                'quiet': True,
+                'format_sort': ['+size'],  # Favor smaller sizes for estimation
+            }
+            ffmpeg_available = self.check_ffmpeg()
+            
+            if format_type == "video":
+                if ffmpeg_available:
+                    if quality == "highest":
+                        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]'
+                    elif quality == "lowest":
+                        ydl_opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]'
+                    else:
+                        height = quality[:-1]
+                        ydl_opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]'
+                else:
+                    if quality == "highest":
+                        ydl_opts['format'] = 'best[ext=mp4]'
+                    elif quality == "lowest":
+                        ydl_opts['format'] = 'worst[ext=mp4]'
+                    else:
+                        height = quality[:-1]
+                        ydl_opts['format'] = f'best[height<={height}][ext=mp4]'
+            else:
+                ydl_opts['format'] = 'bestaudio'
+                if ffmpeg_available:
+                    ydl_opts['postprocessors'] = [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }]
+                else:
+                    ydl_opts['format'] = 'bestaudio[ext=m4a]'
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(clean_url, download=False)
+                filesize = info.get('filesize') or info.get('filesize_approx')
+                if filesize:
+                    return filesize / (1024 * 1024)  # Convert to MB
+                if format_type == "audio" and not filesize:
+                    # Estimate audio size based on bitrate and duration
+                    duration = info.get('duration', 0)
+                    bitrate = 192 if ffmpeg_available else 128  # kbps (MP3 or M4A)
+                    return (duration * bitrate * 1000 / 8) / (1024 * 1024)  # Convert to MB
+                return None
+        except Exception as e:
+            print(f"Error getting file size: {e}")
+            return None
+    
+    def update_file_size(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            self.size_label.configure(text="Estimated Size: Unknown")
+            return
+        format_type = self.format_var.get()
+        quality = self.quality_var.get()
+        filesize_mb = self.get_file_size(url, format_type, quality)
+        if filesize_mb:
+            self.size_label.configure(text=f"Estimated Size: {filesize_mb:.2f} MB")
+        else:
+            self.size_label.configure(text="Estimated Size: Unknown")
+    
     def preview_video(self):
         url = self.url_entry.get().strip()
         if not url:
@@ -382,6 +459,7 @@ class YouTubeDownloader:
         yt, video_id = self.get_video_info(url)
         if yt and video_id:
             self.update_preview(yt, video_id, url)
+            self.update_file_size()
             self.start_loading_animation()
     
     def update_preview(self, yt, video_id, url):
@@ -407,11 +485,11 @@ class YouTubeDownloader:
                 raise Exception("Could not retrieve thumbnail")
             img = Image.open(BytesIO(img_data))
             img = img.resize((160, 90), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
+            self.thumbnail_photo = ImageTk.PhotoImage(img)
             preview_container = ctk.CTkFrame(self.preview_frame)
             preview_container.pack(fill="x", pady=5)
-            thumbnail_label = ctk.CTkLabel(preview_container, image=photo, text="")
-            thumbnail_label.image = photo
+            thumbnail_label = ctk.CTkLabel(preview_container, image=self.thumbnail_photo, text="")
+            thumbnail_label.image = self.thumbnail_photo
             thumbnail_label.pack(side="left", padx=10)
             info_frame = ctk.CTkFrame(preview_container)
             info_frame.pack(side="left", fill="both", expand=True, padx=10)
@@ -423,12 +501,17 @@ class YouTubeDownloader:
             ctk.CTkLabel(info_frame, text=f"Duration: {yt.length//60}:{yt.length%60:02d}").pack(anchor="w", pady=2)
             ctk.CTkLabel(info_frame, text=f"Views: {yt.views:,}").pack(anchor="w", pady=2)
             
-            # Add Play Video button
+            # Add Play Video and Audio Only buttons
             play_button = ctk.CTkButton(info_frame, text="Play Video", 
-                                      command=lambda: self.play_video(url), 
+                                      command=lambda: self.play_stream(url, stream_type="video"), 
                                       fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
                                       font=ctk.CTkFont(weight="bold"))
             play_button.pack(anchor="w", pady=5)
+            audio_button = ctk.CTkButton(info_frame, text="Audio Only", 
+                                       command=lambda: self.play_stream(url, stream_type="audio"), 
+                                       fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                                       font=ctk.CTkFont(weight="bold"))
+            audio_button.pack(anchor="w", pady=5)
             
             # Video streaming frame
             video_container = ctk.CTkFrame(preview_container)
@@ -444,13 +527,23 @@ class YouTubeDownloader:
             self.play_pause_btn = ctk.CTkButton(center_frame, text="▶", command=self.toggle_play_pause, 
                                                width=50, height=50, fg_color="#000000", hover_color="#333333", 
                                                text_color="#FFFFFF", font=ctk.CTkFont(size=20))
-            self.play_pause_btn.pack(side="left", padx=10)
-            ctk.CTkButton(center_frame, text="⏹", command=self.stop_video, 
-                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
-                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
-            ctk.CTkButton(center_frame, text="⛶", command=self.toggle_fullscreen, 
-                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
-                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
+            self.play_pause_btn.pack(side="left", padx=5)
+            self.stop_btn = ctk.CTkButton(center_frame, text="⏹", command=self.stop_stream, 
+                                         width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                                         text_color="#FFFFFF", font=ctk.CTkFont(size=20))
+            self.stop_btn.pack(side="left", padx=5)
+            self.fullscreen_btn = ctk.CTkButton(center_frame, text="⛶", command=self.toggle_fullscreen, 
+                                               width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                                               text_color="#FFFFFF", font=ctk.CTkFont(size=20))
+            self.fullscreen_btn.pack(side="left", padx=5)
+            self.mute_btn = ctk.CTkButton(center_frame, text="🔊", command=self.toggle_mute, 
+                                         width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                                         text_color="#FFFFFF", font=ctk.CTkFont(size=20))
+            self.mute_btn.pack(side="left", padx=5)
+            self.volume_slider = ctk.CTkSlider(center_frame, from_=0, to=100, width=100, 
+                                              command=self.set_volume, progress_color="#FF9866")
+            self.volume_slider.set(50)  # Default volume
+            self.volume_slider.pack(side="left", padx=5)
             
             # Load animation frames
             self.load_animation()
@@ -461,21 +554,34 @@ class YouTubeDownloader:
             print(f"Preview error: {e}")
             self.stop_loading_animation()
     
-    def play_video(self, url):
+    def play_stream(self, url, stream_type="video"):
         try:
             self.start_loading_animation()
             if self.player:
                 self.player.stop()
-            stream_url = self.get_stream_url(url)
+            self.is_audio_only = (stream_type == "audio")
+            stream_url = self.get_stream_url(url, stream_type)
             media = self.vlc_instance.media_new(stream_url)
             self.player = self.vlc_instance.media_player_new()
             self.player.set_media(media)
-            self.player.set_hwnd(self.video_frame.winfo_id())  # Windows
-            # For macOS/Linux, use set_xwindow instead of set_hwnd
-            # if os.name != 'nt':
-            #     self.player.set_xwindow(self.video_frame.winfo_id())
+            if not self.is_audio_only:
+                self.player.set_hwnd(self.video_frame.winfo_id())  # Windows
+                # For macOS/Linux, use set_xwindow instead of set_hwnd
+                # if os.name != 'nt':
+                #     self.player.set_xwindow(self.video_frame.winfo_id())
+            else:
+                # Display thumbnail for audio-only playback
+                if self.thumbnail_photo:
+                    thumbnail_label = ctk.CTkLabel(self.video_frame, image=self.thumbnail_photo, text="")
+                    thumbnail_label.image = self.thumbnail_photo
+                    thumbnail_label.place(relx=0.5, rely=0.5, anchor="center")
             
-            # Set up event manager to detect when video starts playing
+            # Set initial volume
+            self.player.audio_set_volume(int(self.volume_slider.get()))
+            self.player.audio_set_mute(False)
+            self.mute_btn.configure(text="🔊")
+            
+            # Set up event manager to detect playback states
             event_manager = self.player.event_manager()
             event_manager.event_attach(vlc.EventType.MediaPlayerPlaying, 
                                     lambda event: self.root.after(0, self.stop_loading_animation))
@@ -485,13 +591,15 @@ class YouTubeDownloader:
             self.player.play()
             self.is_playing = True
             self.play_pause_btn.configure(text="⏸")
+            # Disable fullscreen button for audio-only
+            self.fullscreen_btn.configure(state="disabled" if self.is_audio_only else "normal")
         except Exception as e:
             self.stop_loading_animation()
-            messagebox.showerror("Error", f"Failed to play video: {str(e)}")
+            messagebox.showerror("Error", f"Failed to play {'audio' if self.is_audio_only else 'video'}: {str(e)}")
     
     def on_playback_error(self):
         self.stop_loading_animation()
-        messagebox.showerror("Error", "Failed to play video: Playback error")
+        messagebox.showerror("Error", f"Failed to play {'audio' if self.is_audio_only else 'video'}: Playback error")
     
     def toggle_play_pause(self):
         if self.player:
@@ -505,20 +613,43 @@ class YouTubeDownloader:
                 self.play_pause_btn.configure(text="⏸")
                 self.is_playing = True
     
-    def stop_video(self):
+    def stop_stream(self):
         if self.player:
             self.player.stop()
             self.is_playing = False
             self.play_pause_btn.configure(text="▶")
+            self.fullscreen_btn.configure(state="normal")
+            self.mute_btn.configure(text="🔊")
+            self.volume_slider.set(50)
             self.stop_loading_animation()
+            # Clear thumbnail for audio-only playback
+            for widget in self.video_frame.winfo_children():
+                widget.destroy()
     
     def toggle_fullscreen(self):
-        if self.player:
+        if self.player and not self.is_audio_only:
             self.player.toggle_fullscreen()
     
-    def get_stream_url(self, url):
+    def toggle_mute(self):
+        if self.player:
+            is_muted = self.player.audio_get_mute()
+            self.player.audio_set_mute(not is_muted)
+            self.mute_btn.configure(text="🔇" if not is_muted else "🔊")
+    
+    def set_volume(self, value):
+        if self.player:
+            self.player.audio_set_volume(int(value))
+            # Update mute state based on volume
+            if int(value) == 0:
+                self.player.audio_set_mute(True)
+                self.mute_btn.configure(text="🔇")
+            else:
+                self.player.audio_set_mute(False)
+                self.mute_btn.configure(text="🔊")
+    
+    def get_stream_url(self, url, stream_type="video"):
         ydl_opts = {
-            'format': 'best',
+            'format': 'bestaudio[abr<=128]/bestaudio' if stream_type == "audio" else 'best',
             'quiet': True
         }
         with YoutubeDL(ydl_opts) as ydl:
@@ -553,8 +684,8 @@ class YouTubeDownloader:
             threading.Thread(target=self.process_download, args=(download_id,), daemon=True).start()
     
     def restart_download(self, download_id):
-        if download_id in self.active_downloads:
-            item = self.active_downloads[download_id]
+        if download_id in download_manager.active_downloads:
+            item = download_manager.active_downloads[download_id]
             item['status'] = 'downloading'
             item['progress'] = 0
             item.pop('downloaded_bytes', None)
@@ -762,8 +893,8 @@ class YouTubeDownloader:
                 if "ffmpeg is not installed" in str(e):
                     error_msg = "Download failed: ffmpeg is required for MP3 conversion or video/audio merging. Please install ffmpeg."
                 print(error_msg)
-                if download_id in self.active_downloads:
-                    self.active_downloads[download_id]['status'] = 'error'
+                if download_id in download_manager.active_downloads:
+                    download_manager.active_downloads[download_id]['status'] = 'error'
                 self.root.after(0, lambda: self.status_label.configure(text=error_msg, text_color="red"))
         finally:
             self.root.after(0, self.update_download_list)
