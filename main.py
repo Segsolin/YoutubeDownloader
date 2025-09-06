@@ -13,6 +13,7 @@ from collections import deque
 import re
 from urllib.parse import urlparse, parse_qs
 from yt_dlp import YoutubeDL
+import shutil
 
 # Global download manager
 class DownloadManager:
@@ -39,14 +40,15 @@ class DownloadManager:
         except FileNotFoundError:
             pass
     
-    def add_download(self, url, options):
+    def add_download(self, url, options, title=None):
         download_id = f"{url}_{time.time()}"
         self.download_queue.append({
             'id': download_id,
             'url': url,
             'options': options,
             'status': 'queued',
-            'progress': 0
+            'progress': 0,
+            'title': title
         })
         self.save_state()
         return download_id
@@ -115,12 +117,14 @@ class YouTubeDownloader:
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
         
+        self.download_frames = {}
+        self.status_labels = {}
+        self.progress_bars = {}
+        self.progress_labels = {}
+        self.control_buttons = {}
+        
         self.setup_ui()
         self.update_download_list()
-        
-        self.running = True
-        self.download_thread = threading.Thread(target=self.download_manager_worker, daemon=True)
-        self.download_thread.start()
         
     def setup_ui(self):
         self.tab_view = ctk.CTkTabview(self.root)
@@ -173,7 +177,7 @@ class YouTubeDownloader:
         ctk.CTkLabel(quality_frame, text="Quality:").pack(side="left")
         self.quality_var = ctk.StringVar(value="highest")
         quality_combo = ctk.CTkComboBox(quality_frame, variable=self.quality_var,
-                                       values=["highest", "720p", "480p", "360p", "lowest"])
+                                       values=["highest", "2160p", "1440p", "1080p", "720p", "480p", "360p", "lowest"])
         quality_combo.pack(side="left", padx=10)
         
         location_frame = ctk.CTkFrame(options_frame)
@@ -213,29 +217,8 @@ class YouTubeDownloader:
                                   font=ctk.CTkFont(size=16, weight="bold"))
         title_label.pack(pady=10)
         
-        tree_frame = ctk.CTkFrame(queue_frame)
-        tree_frame.pack(fill="both", expand=True, pady=10)
-        
-        tree_scroll = ttk.Scrollbar(tree_frame)
-        tree_scroll.pack(side="right", fill="y")
-        
-        self.queue_tree = ttk.Treeview(tree_frame, columns=("status", "progress", "actions"), 
-                                      show="headings", height=10, yscrollcommand=tree_scroll.set)
-        tree_scroll.config(command=self.queue_tree.yview)
-        
-        self.queue_tree.heading("#0", text="Title")
-        self.queue_tree.heading("status", text="Status")
-        self.queue_tree.heading("progress", text="Progress")
-        self.queue_tree.heading("actions", text="Actions")
-        
-        self.queue_tree.column("#0", width=300)
-        self.queue_tree.column("status", width=100)
-        self.queue_tree.column("progress", width=100)
-        self.queue_tree.column("actions", width=150)
-        
-        self.queue_tree.pack(fill="both", expand=True)
-        
-        self.queue_tree.bind("<Button-1>", self.on_tree_click)
+        self.queue_scroll = ctk.CTkScrollableFrame(queue_frame)
+        self.queue_scroll.pack(fill="both", expand=True, pady=10)
         
         control_frame = ctk.CTkFrame(queue_frame)
         control_frame.pack(fill="x", pady=10)
@@ -392,16 +375,15 @@ class YouTubeDownloader:
             messagebox.showerror("Error", "Please enter a YouTube URL")
             return
         clean_url = self.clean_youtube_url(url)
-        video_id = self.extract_video_id(clean_url)
-        if not video_id:
-            messagebox.showerror("Error", "Invalid YouTube URL")
+        yt, video_id = self.get_video_info(clean_url)
+        if not yt:
             return
         options = {
             'format': self.format_var.get(),
             'quality': self.quality_var.get(),
             'location': self.location_var.get()
         }
-        download_id = download_manager.add_download(clean_url, options)
+        download_id = download_manager.add_download(clean_url, options, title=yt.title)
         self.update_download_list()
         self.status_label.configure(text="Download added to queue!")
         if len(download_manager.active_downloads) < 3:
@@ -412,47 +394,105 @@ class YouTubeDownloader:
         if item:
             self.status_label.configure(text=f"Starting download: {item['url'][:30]}...")
             self.update_download_list()
+            threading.Thread(target=self.process_download, args=(download_id,), daemon=True).start()
     
-    def on_tree_click(self, event):
-        region = self.queue_tree.identify("region", event.x, event.y)
-        if region == "cell":
-            column = self.queue_tree.identify_column(event.x)
-            item = self.queue_tree.identify_row(event.y)
-            if item and column == "#4":
-                values = self.queue_tree.item(item, "values")
-                if values and "Start" in values[2]:
-                    self.start_download(item)
-                elif values and "Pause" in values[2]:
-                    download_manager.pause_download(item)
-                    self.update_download_list()
-                elif values and "Resume" in values[2]:
-                    download_manager.resume_download(item)
-                    self.update_download_list()
-                elif values and "Remove" in values[2]:
-                    download_manager.remove_download(item)
-                    self.update_download_list()
+    def restart_download(self, download_id):
+        if download_id in download_manager.active_downloads:
+            item = download_manager.active_downloads[download_id]
+            item['status'] = 'downloading'
+            item['progress'] = 0
+            item.pop('downloaded_bytes', None)
+            item.pop('total_bytes', None)
+            item.pop('speed', None)
+            item.pop('eta', None)
+            download_manager.save_state()
+            threading.Thread(target=self.process_download, args=(download_id,), daemon=True).start()
+            self.update_download_list()
     
     def update_download_list(self):
-        for item in self.queue_tree.get_children():
-            self.queue_tree.delete(item)
-        for download_id, item in download_manager.active_downloads.items():
-            title = item['url'][:40] + "..." if len(item['url']) > 40 else item['url']
-            self.queue_tree.insert("", "end", iid=download_id, text=title,
-                                 values=(item['status'], f"{item.get('progress', 0)}%", 
-                                         "Pause | Remove"))
-        for item in download_manager.download_queue:
-            title = item['url'][:40] + "..." if len(item['url']) > 40 else item['url']
-            action = "Resume | Remove" if item['status'] == 'paused' else "Start | Remove"
-            self.queue_tree.insert("", "end", iid=item['id'], text=title,
-                                 values=(item['status'], "0%", action))
+        current_ids = set(download_manager.active_downloads.keys()) | {item['id'] for item in download_manager.download_queue}
+        
+        for did in list(self.download_frames.keys()):
+            if did not in current_ids:
+                self.download_frames[did].destroy()
+                del self.download_frames[did]
+                del self.status_labels[did]
+                del self.progress_bars[did]
+                del self.progress_labels[did]
+                del self.control_buttons[did]
+        
+        items = list(download_manager.active_downloads.values()) + list(download_manager.download_queue)
+        
+        for item in items:
+            did = item['id']
+            status = item['status']
+            disp_title = item.get('title', item['url'][:40] + "..." if len(item['url']) > 40 else item['url'])
+            progress = item.get('progress', 0)
+            
+            downloaded_mb = item.get('downloaded_bytes', 0) / (1024 * 1024)
+            total_mb = item.get('total_bytes', 0) / (1024 * 1024)
+            speed_kbps = item.get('speed', 0) / 1024 if item.get('speed') else 0
+            eta = item.get('eta')
+            
+            progress_text = f"{progress}% {downloaded_mb:.2f}MB of {total_mb:.2f}MB" if total_mb > 0 else f"{progress}%"
+            if speed_kbps > 0:
+                progress_text += f" at {speed_kbps:.2f}KiB/s"
+            if eta is not None:
+                h = eta // 3600
+                m = (eta % 3600) // 60
+                s = eta % 60
+                eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+                progress_text += f" in {eta_str}"
+            
+            if did not in self.download_frames:
+                item_frame = ctk.CTkFrame(self.queue_scroll)
+                item_frame.pack(fill="x", pady=5)
+                
+                title_label = ctk.CTkLabel(item_frame, text=disp_title, width=300, anchor="w")
+                title_label.pack(side="left", padx=5)
+                
+                self.status_labels[did] = ctk.CTkLabel(item_frame, text=status, width=100)
+                self.status_labels[did].pack(side="left", padx=5)
+                
+                progress_frame = ctk.CTkFrame(item_frame, width=300)
+                progress_frame.pack(side="left", padx=5)
+                
+                self.progress_bars[did] = ctk.CTkProgressBar(progress_frame, width=250)
+                self.progress_bars[did].pack(side="top")
+                
+                self.progress_labels[did] = ctk.CTkLabel(progress_frame, text=progress_text)
+                self.progress_labels[did].pack(side="top")
+                
+                self.control_buttons[did] = ctk.CTkButton(item_frame, width=80)
+                self.control_buttons[did].pack(side="left", padx=5)
+                
+                remove_btn = ctk.CTkButton(item_frame, text="Remove", width=80, 
+                                           command=lambda d=did: (download_manager.remove_download(d), self.update_download_list()))
+                remove_btn.pack(side="left", padx=5)
+                
+                self.download_frames[did] = item_frame
+            
+            self.status_labels[did].configure(text=status)
+            self.progress_bars[did].set(progress / 100)
+            self.progress_labels[did].configure(text=progress_text)
+            
+            if status == 'downloading':
+                self.control_buttons[did].configure(text="Pause", command=lambda d=did: (download_manager.pause_download(d), self.update_download_list()))
+            elif status == 'queued':
+                self.control_buttons[did].configure(text="Start", command=lambda d=did: self.start_download(d))
+            elif status == 'paused':
+                self.control_buttons[did].configure(text="Resume", command=lambda d=did: (download_manager.resume_download(d), self.update_download_list()))
+            elif status == 'error':
+                self.control_buttons[did].configure(text="Restart", command=lambda d=did: self.restart_download(d))
+        
         for item in self.history_tree.get_children():
             self.history_tree.delete(item)
         for item in download_manager.download_history:
-            title = item['url'][:50] + "..." if len(item['url']) > 50 else item['url']
-            self.history_tree.insert("", "end", text=title,
-                                   values=(item['options']['format'], 
-                                           time.strftime('%Y-%m-%d %H:%M', 
-                                                         time.localtime(item.get('completed_at', time.time())))))
+            disp_title = item.get('title', item['url'][:50] + "..." if len(item['url']) > 50 else item['url'])
+            self.history_tree.insert("", "end", text=disp_title,
+                                     values=(item['options']['format'], 
+                                             time.strftime('%Y-%m-%d %H:%M', 
+                                                           time.localtime(item.get('completed_at', time.time())))))
     
     def start_all_downloads(self):
         count = 0
@@ -490,23 +530,15 @@ class YouTubeDownloader:
         if os.path.exists(path):
             os.startfile(path)
     
-    def download_manager_worker(self):
-        while self.running:
-            try:
-                for download_id, item in list(download_manager.active_downloads.items()):
-                    if item['status'] == 'downloading':
-                        self.process_download(download_id)
-                time.sleep(2)
-            except Exception as e:
-                print(f"Download manager error: {e}")
-                time.sleep(5)
+    def check_ffmpeg(self):
+        return shutil.which("ffmpeg") is not None
     
     def process_download(self, download_id):
         item = download_manager.active_downloads.get(download_id)
         if not item or item['status'] != 'downloading':
             return
         try:
-            self.status_label.configure(text=f"Downloading: {item['url'][:30]}...")
+            self.root.after(0, lambda: self.status_label.configure(text=f"Downloading: {item['url'][:30]}..."))
             clean_url = self.clean_youtube_url(item['url'])
             download_path = item['options']['location']
             format_type = item['options']['format']
@@ -518,41 +550,69 @@ class YouTubeDownloader:
                 'noplaylist': True,
             }
             
+            ffmpeg_available = self.check_ffmpeg()
+            
             if format_type == "video":
-                if quality == "highest":
-                    ydl_opts['format'] = 'best[ext=mp4]'
-                elif quality == "lowest":
-                    ydl_opts['format'] = 'worst[ext=mp4]'
+                if ffmpeg_available:
+                    if quality == "highest":
+                        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]'
+                    elif quality == "lowest":
+                        ydl_opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]'
+                    else:
+                        height = quality[:-1]
+                        ydl_opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]'
                 else:
-                    ydl_opts['format'] = f'[ext=mp4][height<={quality[:-1]}]'
+                    if quality == "highest":
+                        ydl_opts['format'] = 'best[ext=mp4]'
+                    elif quality == "lowest":
+                        ydl_opts['format'] = 'worst[ext=mp4]'
+                    else:
+                        height = quality[:-1]
+                        ydl_opts['format'] = f'best[height<={height}][ext=mp4]'
+                    self.root.after(0, lambda: self.status_label.configure(
+                        text="Warning: ffmpeg not found. Using single stream format, quality may be limited.",
+                        text_color="yellow"))
             else:
                 ydl_opts['format'] = 'bestaudio[ext=m4a]'
             
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(clean_url, download=True)
+                if 'title' in info and not item.get('title'):
+                    item['title'] = info['title']
                 output_file = ydl.prepare_filename(info)
             
             download_manager.complete_download(download_id, output_file)
-            self.status_label.configure(text=f"Download completed: {os.path.basename(output_file)}")
+            self.root.after(0, lambda: self.status_label.configure(text=f"Download completed: {os.path.basename(output_file)}"))
         except Exception as e:
-            error_msg = f"Download failed: {str(e)}"
-            print(f"Download error: {error_msg}")
-            if download_id in download_manager.active_downloads:
-                download_manager.active_downloads[download_id]['status'] = 'error'
-            self.status_label.configure(text=error_msg)
+            if "Download interrupted" in str(e):
+                print("Download paused")
+            else:
+                error_msg = f"Download failed: {str(e)}"
+                if "ffmpeg is not installed" in str(e):
+                    error_msg = "Download failed: ffmpeg is required for merging video/audio streams. Please install ffmpeg."
+                print(error_msg)
+                if download_id in download_manager.active_downloads:
+                    download_manager.active_downloads[download_id]['status'] = 'error'
+                self.root.after(0, lambda: self.status_label.configure(text=error_msg, text_color="red"))
         finally:
-            self.update_download_list()
+            self.root.after(0, self.update_download_list)
     
     def on_progress(self, download_id, data):
-        if data['status'] == 'downloading':
-            if 'total_bytes' in data and 'downloaded_bytes' in data:
+        item = download_manager.active_downloads.get(download_id)
+        if item and data['status'] == 'downloading':
+            if 'total_bytes' in data and data['total_bytes'] > 0 and 'downloaded_bytes' in data:
                 percentage = (data['downloaded_bytes'] / data['total_bytes']) * 100
-                if download_id in download_manager.active_downloads:
-                    download_manager.active_downloads[download_id]['progress'] = int(percentage)
-                    self.update_download_list()
-    
-    def __del__(self):
-        self.running = False
+                item['progress'] = int(percentage)
+            elif 'total_bytes_estimate' in data and 'downloaded_bytes' in data:
+                percentage = (data['downloaded_bytes'] / data['total_bytes_estimate']) * 100
+                item['progress'] = int(percentage)
+            item['downloaded_bytes'] = data.get('downloaded_bytes', 0)
+            item['total_bytes'] = data.get('total_bytes', data.get('total_bytes_estimate', 0))
+            item['speed'] = data.get('speed')
+            item['eta'] = data.get('eta')
+            if item['status'] != 'downloading':
+                raise Exception("Download interrupted")
+            self.root.after(0, self.update_download_list)
 
 def main():
     root = ctk.CTk()

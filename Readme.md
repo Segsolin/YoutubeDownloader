@@ -1,0 +1,1 @@
+pyinstaller --windowed --name YouTubeDownloader --add-data "ffmpeg.exe;." youtube_downloader.py
