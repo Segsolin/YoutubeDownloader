@@ -125,12 +125,18 @@ class YouTubeDownloader:
         self.control_buttons = {}
         self.vlc_instance = vlc.Instance()
         self.player = None
+        self.is_playing = False
+        self.loading_label = None
+        self.loading_frames = []
+        self.current_frame = 0
+        self.animation_running = False
         
         self.setup_ui()
         self.update_download_list()
         
     def setup_ui(self):
         self.tab_view = ctk.CTkTabview(self.root)
+        self.tab_view.configure(fg_color="#000000", text_color="#FFFFFF")
         self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
         
         self.download_tab = self.tab_view.add("Download")
@@ -195,18 +201,20 @@ class YouTubeDownloader:
         self.location_entry = ctk.CTkEntry(loc_subframe, textvariable=self.location_var)
         self.location_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
-        ctk.CTkButton(loc_subframe, text="Browse", width=80, 
-                     command=self.browse_location).pack(side="right")
+        ctk.CTkButton(loc_subframe, text="Browse", width=80, fg_color="#FF9866", 
+                      hover_color="#FFAB80", text_color="#000000", font=ctk.CTkFont(weight="bold")).pack(side="right")
         
         buttons_frame = ctk.CTkFrame(main_frame)
         buttons_frame.pack(fill="x", padx=20, pady=20)
         
         self.download_btn = ctk.CTkButton(buttons_frame, text="Add to Queue", 
-                                         command=self.add_to_queue, height=40)
+                                         command=self.add_to_queue, height=40, fg_color="#FF9866", 
+                                         hover_color="#FFAB80", text_color="#000000", font=ctk.CTkFont(weight="bold"))
         self.download_btn.pack(side="left", padx=10)
         
         self.preview_btn = ctk.CTkButton(buttons_frame, text="Preview", 
-                                        command=self.preview_video, height=40)
+                                        command=self.preview_video, height=40, fg_color="#FF9866", 
+                                        hover_color="#FFAB80", text_color="#000000", font=ctk.CTkFont(weight="bold"))
         self.preview_btn.pack(side="left", padx=10)
         
         self.status_label = ctk.CTkLabel(main_frame, text="Ready")
@@ -226,9 +234,15 @@ class YouTubeDownloader:
         control_frame = ctk.CTkFrame(queue_frame)
         control_frame.pack(fill="x", pady=10)
         
-        ctk.CTkButton(control_frame, text="Start All", command=self.start_all_downloads).pack(side="left", padx=5)
-        ctk.CTkButton(control_frame, text="Pause All", command=self.pause_all_downloads).pack(side="left", padx=5)
-        ctk.CTkButton(control_frame, text="Clear Completed", command=self.clear_completed).pack(side="left", padx=5)
+        ctk.CTkButton(control_frame, text="Start All", command=self.start_all_downloads, 
+                      fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                      font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
+        ctk.CTkButton(control_frame, text="Pause All", command=self.pause_all_downloads, 
+                      fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                      font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
+        ctk.CTkButton(control_frame, text="Clear Completed", command=self.clear_completed, 
+                      fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                      font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
         
     def setup_history_tab(self):
         history_frame = ctk.CTkFrame(self.history_tab)
@@ -261,8 +275,48 @@ class YouTubeDownloader:
         control_frame = ctk.CTkFrame(history_frame)
         control_frame.pack(fill="x", pady=10)
         
-        ctk.CTkButton(control_frame, text="Clear History", command=self.clear_history).pack(side="left", padx=5)
-        ctk.CTkButton(control_frame, text="Open Download Folder", command=self.open_download_folder).pack(side="right", padx=5)
+        ctk.CTkButton(control_frame, text="Clear History", command=self.clear_history, 
+                      fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                      font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
+        ctk.CTkButton(control_frame, text="Open Download Folder", command=self.open_download_folder, 
+                      fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                      font=ctk.CTkFont(weight="bold")).pack(side="right", padx=5)
+    
+    def load_animation(self):
+        try:
+            gif_path = os.path.join(os.path.dirname(__file__), "loading.gif")
+            gif = Image.open(gif_path)
+            self.loading_frames = []
+            try:
+                while True:
+                    frame = gif.copy()
+                    frame = frame.resize((64, 64), Image.Resampling.LANCZOS)
+                    self.loading_frames.append(ImageTk.PhotoImage(frame))
+                    gif.seek(len(self.loading_frames))
+            except EOFError:
+                pass
+        except FileNotFoundError:
+            print("Loading GIF not found. Please ensure 'loading.gif' is in the project directory.")
+            self.loading_frames = []
+    
+    def start_loading_animation(self):
+        if self.loading_frames and not self.animation_running:
+            self.animation_running = True
+            self.loading_label = ctk.CTkLabel(self.video_frame, image=self.loading_frames[0], text="")
+            self.loading_label.place(relx=0.5, rely=0.5, anchor="center")
+            self.animate_loading()
+    
+    def animate_loading(self):
+        if self.animation_running and self.loading_frames:
+            self.current_frame = (self.current_frame + 1) % len(self.loading_frames)
+            self.loading_label.configure(image=self.loading_frames[self.current_frame])
+            self.root.after(100, self.animate_loading)
+    
+    def stop_loading_animation(self):
+        self.animation_running = False
+        if self.loading_label:
+            self.loading_label.destroy()
+            self.loading_label = None
     
     def browse_location(self):
         directory = filedialog.askdirectory()
@@ -328,6 +382,7 @@ class YouTubeDownloader:
         yt, video_id = self.get_video_info(url)
         if yt and video_id:
             self.update_preview(yt, video_id, url)
+            self.start_loading_animation()
     
     def update_preview(self, yt, video_id, url):
         for widget in self.preview_frame.winfo_children():
@@ -370,19 +425,45 @@ class YouTubeDownloader:
             
             # Add Play Video button
             play_button = ctk.CTkButton(info_frame, text="Play Video", 
-                                      command=lambda: self.play_video(url))
+                                      command=lambda: self.play_video(url), 
+                                      fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                                      font=ctk.CTkFont(weight="bold"))
             play_button.pack(anchor="w", pady=5)
             
             # Video streaming frame
-            self.video_frame = ctk.CTkFrame(preview_container, width=320, height=180)
-            self.video_frame.pack(side="right", padx=10)
+            video_container = ctk.CTkFrame(preview_container)
+            video_container.pack(side="right", padx=10)
+            self.video_frame = ctk.CTkFrame(video_container, width=320, height=180)
+            self.video_frame.pack(pady=5)
+            
+            # Player control buttons (icon-only, centered, black with white icons, larger size)
+            control_frame = ctk.CTkFrame(video_container)
+            control_frame.pack(fill="x", pady=5)
+            center_frame = ctk.CTkFrame(control_frame)
+            center_frame.pack(fill="x", expand=True)
+            self.play_pause_btn = ctk.CTkButton(center_frame, text="▶", command=self.toggle_play_pause, 
+                                               width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                                               text_color="#FFFFFF", font=ctk.CTkFont(size=20))
+            self.play_pause_btn.pack(side="left", padx=10)
+            ctk.CTkButton(center_frame, text="⏹", command=self.stop_video, 
+                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
+            ctk.CTkButton(center_frame, text="⛶", command=self.toggle_fullscreen, 
+                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
+            
+            # Load animation frames
+            self.load_animation()
+            
         except Exception as e:
             error_label = ctk.CTkLabel(self.preview_frame, text=f"Preview unavailable: {str(e)}", text_color="red")
             error_label.pack(pady=10)
             print(f"Preview error: {e}")
+            self.stop_loading_animation()
     
     def play_video(self, url):
         try:
+            self.start_loading_animation()
             if self.player:
                 self.player.stop()
             stream_url = self.get_stream_url(url)
@@ -393,9 +474,47 @@ class YouTubeDownloader:
             # For macOS/Linux, use set_xwindow instead of set_hwnd
             # if os.name != 'nt':
             #     self.player.set_xwindow(self.video_frame.winfo_id())
+            
+            # Set up event manager to detect when video starts playing
+            event_manager = self.player.event_manager()
+            event_manager.event_attach(vlc.EventType.MediaPlayerPlaying, 
+                                    lambda event: self.root.after(0, self.stop_loading_animation))
+            event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError, 
+                                    lambda event: self.root.after(0, self.on_playback_error))
+            
             self.player.play()
+            self.is_playing = True
+            self.play_pause_btn.configure(text="⏸")
         except Exception as e:
+            self.stop_loading_animation()
             messagebox.showerror("Error", f"Failed to play video: {str(e)}")
+    
+    def on_playback_error(self):
+        self.stop_loading_animation()
+        messagebox.showerror("Error", "Failed to play video: Playback error")
+    
+    def toggle_play_pause(self):
+        if self.player:
+            if self.is_playing:
+                self.player.pause()
+                self.play_pause_btn.configure(text="▶")
+                self.is_playing = False
+            else:
+                self.start_loading_animation()
+                self.player.play()
+                self.play_pause_btn.configure(text="⏸")
+                self.is_playing = True
+    
+    def stop_video(self):
+        if self.player:
+            self.player.stop()
+            self.is_playing = False
+            self.play_pause_btn.configure(text="▶")
+            self.stop_loading_animation()
+    
+    def toggle_fullscreen(self):
+        if self.player:
+            self.player.toggle_fullscreen()
     
     def get_stream_url(self, url):
         ydl_opts = {
@@ -434,8 +553,8 @@ class YouTubeDownloader:
             threading.Thread(target=self.process_download, args=(download_id,), daemon=True).start()
     
     def restart_download(self, download_id):
-        if download_id in download_manager.active_downloads:
-            item = download_manager.active_downloads[download_id]
+        if download_id in self.active_downloads:
+            item = self.active_downloads[download_id]
             item['status'] = 'downloading'
             item['progress'] = 0
             item.pop('downloaded_bytes', None)
@@ -500,11 +619,15 @@ class YouTubeDownloader:
                 self.progress_labels[did] = ctk.CTkLabel(progress_frame, text=progress_text)
                 self.progress_labels[did].pack(side="top")
                 
-                self.control_buttons[did] = ctk.CTkButton(item_frame, width=80)
+                self.control_buttons[did] = ctk.CTkButton(item_frame, width=80, fg_color="#FF9866", 
+                                                         hover_color="#FFAB80", text_color="#000000", 
+                                                         font=ctk.CTkFont(weight="bold"))
                 self.control_buttons[did].pack(side="left", padx=5)
                 
                 remove_btn = ctk.CTkButton(item_frame, text="Remove", width=80, 
-                                           command=lambda d=did: (download_manager.remove_download(d), self.update_download_list()))
+                                           command=lambda d=did: (download_manager.remove_download(d), self.update_download_list()),
+                                           fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
+                                           font=ctk.CTkFont(weight="bold"))
                 remove_btn.pack(side="left", padx=5)
                 
                 self.download_frames[did] = item_frame
@@ -639,8 +762,8 @@ class YouTubeDownloader:
                 if "ffmpeg is not installed" in str(e):
                     error_msg = "Download failed: ffmpeg is required for MP3 conversion or video/audio merging. Please install ffmpeg."
                 print(error_msg)
-                if download_id in download_manager.active_downloads:
-                    download_manager.active_downloads[download_id]['status'] = 'error'
+                if download_id in self.active_downloads:
+                    self.active_downloads[download_id]['status'] = 'error'
                 self.root.after(0, lambda: self.status_label.configure(text=error_msg, text_color="red"))
         finally:
             self.root.after(0, self.update_download_list)
