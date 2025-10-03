@@ -133,6 +133,9 @@ class YouTubeDownloader:
         self.animation_running = False
         self.thumbnail_photo = None
         self.size_label = None
+        self.size_toggle_var = ctk.BooleanVar(value=False)
+        self.size_fetching = False
+        self.size_loading_label = None
         
         self.setup_ui()
         self.update_download_list()
@@ -195,8 +198,23 @@ class YouTubeDownloader:
                                        values=["highest", "2160p", "1440p", "1080p", "720p", "480p", "360p", "lowest"])
         quality_combo.pack(side="left", padx=10)
         
-        self.size_label = ctk.CTkLabel(options_frame, text="Estimated Size: Unknown")
-        self.size_label.pack(anchor="w", pady=5)
+        size_toggle_frame = ctk.CTkFrame(options_frame)
+        size_toggle_frame.pack(fill="x", pady=5)
+        
+        self.size_toggle = ctk.CTkSwitch(size_toggle_frame, text="Show File Size", variable=self.size_toggle_var, 
+                                        command=self.toggle_size_display)
+        self.size_toggle.pack(anchor="w")
+        
+        self.size_display_frame = ctk.CTkFrame(options_frame)
+        self.size_display_frame.pack(fill="x", pady=5)
+        
+        self.size_label = ctk.CTkLabel(self.size_display_frame, text="Estimated Size: Unknown")
+        self.size_label.pack(side="left")
+        
+        self.size_loading_label = ctk.CTkLabel(self.size_display_frame, text="")
+        self.size_loading_label.pack(side="left", padx=10)
+        
+        self.size_display_frame.pack_forget()  # Hide initially
         
         location_frame = ctk.CTkFrame(options_frame)
         location_frame.pack(fill="x", pady=5)
@@ -230,6 +248,38 @@ class YouTubeDownloader:
         self.status_label = ctk.CTkLabel(main_frame, text="Ready")
         self.status_label.pack(pady=10)
         
+    def toggle_size_display(self):
+        if self.size_toggle_var.get():
+            self.size_display_frame.pack(fill="x", pady=5)
+            self.update_file_size()
+        else:
+            self.size_display_frame.pack_forget()
+    
+    def update_file_size(self):
+        if not self.size_toggle_var.get():
+            return
+        if self.size_fetching:
+            return
+        self.size_fetching = True
+        self.size_label.configure(text="Estimated Size: Fetching...")
+        self.size_loading_label.configure(text="Loading...")
+        url = self.url_entry.get().strip()
+        format_type = self.format_var.get()
+        quality = self.quality_var.get()
+        threading.Thread(target=self.fetch_file_size, args=(url, format_type, quality)).start()
+    
+    def fetch_file_size(self, url, format_type, quality):
+        filesize_mb = self.get_file_size(url, format_type, quality)
+        self.root.after(0, lambda: self.display_file_size(filesize_mb))
+    
+    def display_file_size(self, filesize_mb):
+        if filesize_mb:
+            self.size_label.configure(text=f"Estimated Size: {filesize_mb:.2f} MB")
+        else:
+            self.size_label.configure(text="Estimated Size: Unknown")
+        self.size_loading_label.configure(text="")
+        self.size_fetching = False
+    
     def setup_queue_tab(self):
         queue_frame = ctk.CTkFrame(self.queue_tab)
         queue_frame.pack(fill="both", expand=True, padx=20, pady=20)
@@ -292,42 +342,6 @@ class YouTubeDownloader:
                       fg_color="#FF9866", hover_color="#FFAB80", text_color="#000000", 
                       font=ctk.CTkFont(weight="bold")).pack(side="right", padx=5)
     
-    def load_animation(self):
-        try:
-            gif_path = os.path.join(os.path.dirname(__file__), "loading.gif")
-            gif = Image.open(gif_path)
-            self.loading_frames = []
-            try:
-                while True:
-                    frame = gif.copy()
-                    frame = frame.resize((64, 64), Image.Resampling.LANCZOS)
-                    self.loading_frames.append(ImageTk.PhotoImage(frame))
-                    gif.seek(len(self.loading_frames))
-            except EOFError:
-                pass
-        except FileNotFoundError:
-            print("Loading GIF not found. Please ensure 'loading.gif' is in the project directory.")
-            self.loading_frames = []
-    
-    def start_loading_animation(self):
-        if self.loading_frames and not self.animation_running:
-            self.animation_running = True
-            self.loading_label = ctk.CTkLabel(self.video_frame, image=self.loading_frames[0], text="")
-            self.loading_label.place(relx=0.5, rely=0.5, anchor="center")
-            self.animate_loading()
-    
-    def animate_loading(self):
-        if self.animation_running and self.loading_frames:
-            self.current_frame = (self.current_frame + 1) % len(self.loading_frames)
-            self.loading_label.configure(image=self.loading_frames[self.current_frame])
-            self.root.after(100, self.animate_loading)
-    
-    def stop_loading_animation(self):
-        self.animation_running = False
-        if self.loading_label:
-            self.loading_label.destroy()
-            self.loading_label = None
-    
     def browse_location(self):
         directory = filedialog.askdirectory()
         if directory:
@@ -365,7 +379,6 @@ class YouTubeDownloader:
                     self.title = info.get('title', 'Unknown Title')
                     self.length = int(info.get('duration', 0))
                     self.views = int(info.get('view_count', 0))
-                    self.formats = info.get('formats', [])
             yt = VideoInfo(info)
             return yt, video_id
         except Exception as e:
@@ -384,72 +397,6 @@ class YouTubeDownloader:
             if match:
                 return match.group(1)
         return None
-    
-    def get_file_size(self, url, format_type, quality):
-        try:
-            clean_url = self.clean_youtube_url(url)
-            ydl_opts = {
-                'noplaylist': True,
-                'quiet': True,
-                'format_sort': ['+size'],  # Favor smaller sizes for estimation
-            }
-            ffmpeg_available = self.check_ffmpeg()
-            
-            if format_type == "video":
-                if ffmpeg_available:
-                    if quality == "highest":
-                        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]'
-                    elif quality == "lowest":
-                        ydl_opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]'
-                    else:
-                        height = quality[:-1]
-                        ydl_opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]'
-                else:
-                    if quality == "highest":
-                        ydl_opts['format'] = 'best[ext=mp4]'
-                    elif quality == "lowest":
-                        ydl_opts['format'] = 'worst[ext=mp4]'
-                    else:
-                        height = quality[:-1]
-                        ydl_opts['format'] = f'best[height<={height}][ext=mp4]'
-            else:
-                ydl_opts['format'] = 'bestaudio'
-                if ffmpeg_available:
-                    ydl_opts['postprocessors'] = [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }]
-                else:
-                    ydl_opts['format'] = 'bestaudio[ext=m4a]'
-            
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(clean_url, download=False)
-                filesize = info.get('filesize') or info.get('filesize_approx')
-                if filesize:
-                    return filesize / (1024 * 1024)  # Convert to MB
-                if format_type == "audio" and not filesize:
-                    # Estimate audio size based on bitrate and duration
-                    duration = info.get('duration', 0)
-                    bitrate = 192 if ffmpeg_available else 128  # kbps (MP3 or M4A)
-                    return (duration * bitrate * 1000 / 8) / (1024 * 1024)  # Convert to MB
-                return None
-        except Exception as e:
-            print(f"Error getting file size: {e}")
-            return None
-    
-    def update_file_size(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            self.size_label.configure(text="Estimated Size: Unknown")
-            return
-        format_type = self.format_var.get()
-        quality = self.quality_var.get()
-        filesize_mb = self.get_file_size(url, format_type, quality)
-        if filesize_mb:
-            self.size_label.configure(text=f"Estimated Size: {filesize_mb:.2f} MB")
-        else:
-            self.size_label.configure(text="Estimated Size: Unknown")
     
     def preview_video(self):
         url = self.url_entry.get().strip()
@@ -527,23 +474,20 @@ class YouTubeDownloader:
             self.play_pause_btn = ctk.CTkButton(center_frame, text="▶", command=self.toggle_play_pause, 
                                                width=50, height=50, fg_color="#000000", hover_color="#333333", 
                                                text_color="#FFFFFF", font=ctk.CTkFont(size=20))
-            self.play_pause_btn.pack(side="left", padx=5)
-            self.stop_btn = ctk.CTkButton(center_frame, text="⏹", command=self.stop_stream, 
-                                         width=50, height=50, fg_color="#000000", hover_color="#333333", 
-                                         text_color="#FFFFFF", font=ctk.CTkFont(size=20))
-            self.stop_btn.pack(side="left", padx=5)
-            self.fullscreen_btn = ctk.CTkButton(center_frame, text="⛶", command=self.toggle_fullscreen, 
-                                               width=50, height=50, fg_color="#000000", hover_color="#333333", 
-                                               text_color="#FFFFFF", font=ctk.CTkFont(size=20))
-            self.fullscreen_btn.pack(side="left", padx=5)
-            self.mute_btn = ctk.CTkButton(center_frame, text="🔊", command=self.toggle_mute, 
-                                         width=50, height=50, fg_color="#000000", hover_color="#333333", 
-                                         text_color="#FFFFFF", font=ctk.CTkFont(size=20))
-            self.mute_btn.pack(side="left", padx=5)
+            self.play_pause_btn.pack(side="left", padx=10)
+            ctk.CTkButton(center_frame, text="⏹", command=self.stop_stream, 
+                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
+            ctk.CTkButton(center_frame, text="⛶", command=self.toggle_fullscreen, 
+                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
+            ctk.CTkButton(center_frame, text="🔊", command=self.toggle_mute, 
+                          width=50, height=50, fg_color="#000000", hover_color="#333333", 
+                          text_color="#FFFFFF", font=ctk.CTkFont(size=20)).pack(side="left", padx=10)
             self.volume_slider = ctk.CTkSlider(center_frame, from_=0, to=100, width=100, 
                                               command=self.set_volume, progress_color="#FF9866")
             self.volume_slider.set(50)  # Default volume
-            self.volume_slider.pack(side="left", padx=5)
+            self.volume_slider.pack(side="left", padx=10)
             
             # Load animation frames
             self.load_animation()
@@ -684,8 +628,8 @@ class YouTubeDownloader:
             threading.Thread(target=self.process_download, args=(download_id,), daemon=True).start()
     
     def restart_download(self, download_id):
-        if download_id in download_manager.active_downloads:
-            item = download_manager.active_downloads[download_id]
+        if download_id in self.active_downloads:
+            item = self.active_downloads[download_id]
             item['status'] = 'downloading'
             item['progress'] = 0
             item.pop('downloaded_bytes', None)
