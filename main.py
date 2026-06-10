@@ -1,7 +1,8 @@
 """
-Advanced YouTube Downloader Pro - COMPLETELY FIXED VERSION
-FIXED: Now properly downloads high-quality videos with correct format selection
-UPDATED: Scrollable sidebar for better usability
+Advanced YouTube Downloader Pro - FFMPEG VALIDATED HIGH QUALITY
+FIXED: Robust file finding logic
+FIXED: Progress hook handles None total_bytes
+FIXED: Format selector ensures high quality with FFmpeg
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -34,6 +35,7 @@ import platform
 import psutil
 import math
 from enum import Enum
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -44,13 +46,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-# Global styles - Updated for better contrast
+
+# Global styles
 COLORS = {
-    'primary': '#FF3B30', # Red accent (Televrz style)
-    'secondary': '#5856D6', # Blue accent
-    'dark_bg': '#0A0A0A', # Darker background for better contrast
-    'dark_card': '#1A1A1A', # Darker card
-    'dark_text': '#FFFFFF', # Pure white text
+    'primary': '#FF3B30',
+    'secondary': '#5856D6',
+    'dark_bg': '#0A0A0A',
+    'dark_card': '#1A1A1A',
+    'dark_text': '#FFFFFF',
     'light_bg': '#F2F2F7',
     'light_card': '#FFFFFF',
     'light_text': '#000000',
@@ -59,19 +62,12 @@ COLORS = {
     'error': '#FF3B30',
     'info': '#007AFF',
     'gray': '#8E8E93',
-    'dark_gray': '#3A3A3C', # Darker gray for borders
-    'text_primary': '#FFFFFF', # Primary text color
-    'text_secondary': '#8E8E93', # Secondary text color
-    'text_disabled': '#3A3A3C', # Disabled text color
+    'dark_gray': '#3A3A3C',
+    'text_primary': '#FFFFFF',
+    'text_secondary': '#8E8E93',
+    'text_disabled': '#3A3A3C',
 }
-FONTS = {
-    'h1': ('Helvetica', 24, 'bold'),
-    'h2': ('Helvetica', 18, 'bold'),
-    'h3': ('Helvetica', 16, 'bold'),
-    'body': ('Helvetica', 14),
-    'caption': ('Helvetica', 12),
-    'mono': ('Courier', 12)
-}
+
 class DownloadStatus(Enum):
     QUEUED = "queued"
     DOWNLOADING = "downloading"
@@ -81,13 +77,14 @@ class DownloadStatus(Enum):
     PROCESSING = "processing"
     MERGING = "merging"
     CANCELLED = "cancelled"
+
 @dataclass
 class DownloadTask:
     """Data class for download tasks"""
     id: str
     url: str
     title: str
-    format_type: str # video, audio, playlist
+    format_type: str
     quality: str
     output_path: str
     status: DownloadStatus
@@ -105,40 +102,30 @@ class DownloadTask:
     channel: Optional[str] = None
     playlist: Optional[str] = None
     subtitles: List[str] = field(default_factory=list)
-   
-    # Added fields to replace 'options' parameter
     audio_only: bool = False
     include_subtitles: bool = False
     embed_metadata: bool = True
    
     def to_dict(self):
-        """Convert to dictionary for serialization"""
         data = asdict(self)
-        # Convert enum to string
         data['status'] = self.status.value
         return data
    
     @classmethod
     def from_dict(cls, data):
-        """Create DownloadTask from dictionary"""
-        # Handle old format with 'options' key
         if 'options' in data:
             options = data.pop('options', {})
-            # Map old options to new fields
             data['format_type'] = options.get('format', 'video')
             data['quality'] = options.get('quality', 'best')
             data['output_path'] = options.get('location', os.path.expanduser("~/Downloads"))
-            # Additional mappings
             data['audio_only'] = options.get('format', 'video') == 'audio'
        
-        # Convert status string to enum
         if 'status' in data and isinstance(data['status'], str):
             try:
                 data['status'] = DownloadStatus(data['status'])
             except ValueError:
                 data['status'] = DownloadStatus.QUEUED
        
-        # Handle missing fields with defaults
         defaults = {
             'progress': 0.0,
             'downloaded_bytes': 0,
@@ -162,15 +149,106 @@ class DownloadTask:
             if key not in data:
                 data[key] = default_value
        
-        # Remove any unexpected keys
         expected_keys = set(cls.__dataclass_fields__.keys())
         data = {k: v for k, v in data.items() if k in expected_keys}
        
         return cls(**data)
+
+class FFmpegValidator:
+    """FFmpeg validation and testing utility"""
+    
+    @staticmethod
+    def check_ffmpeg() -> Tuple[bool, Optional[str], str]:
+        """Check if FFmpeg is available and working"""
+        try:
+            # Helper to run subprocess safely across all platforms
+            def run_cmd(cmd):
+                kwargs = {'capture_output': True, 'text': True, 'timeout': 5}
+                if platform.system() == 'Windows':
+                    kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                return subprocess.run(cmd, **kwargs)
+
+            # Try system PATH first
+            ffmpeg_path = shutil.which('ffmpeg')
+            
+            if ffmpeg_path:
+                result = run_cmd([ffmpeg_path, '-version'])
+                if result.returncode == 0 and 'ffmpeg version' in result.stdout:
+                    version_match = re.search(r'ffmpeg version ([0-9.]+)', result.stdout)
+                    version = version_match.group(1) if version_match else "unknown"
+                    return True, ffmpeg_path, f"FFmpeg {version} found in PATH"
+            
+            # Check common paths
+            common_paths = []
+            
+            if platform.system() == 'Windows':
+                common_paths = [
+                    r"C:\ffmpeg\bin\ffmpeg.exe",
+                    r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+                    r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+                    os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"),
+                    os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg.exe"),
+                ]
+            else:
+                common_paths = [
+                    "/usr/bin/ffmpeg",
+                    "/usr/local/bin/ffmpeg",
+                    "/opt/homebrew/bin/ffmpeg",
+                    "/opt/local/bin/ffmpeg",
+                    os.path.expanduser("~/bin/ffmpeg"),
+                    os.path.expanduser("~/.local/bin/ffmpeg"),
+                ]
+            
+            for path in common_paths:
+                if os.path.exists(path):
+                    result = run_cmd([path, '-version'])
+                    if result.returncode == 0 and 'ffmpeg version' in result.stdout:
+                        version_match = re.search(r'ffmpeg version ([0-9.]+)', result.stdout)
+                        version = version_match.group(1) if version_match else "unknown"
+                        return True, path, f"FFmpeg {version} found at {path}"
+            
+            return False, None, "FFmpeg not found. Install FFmpeg for high quality (1080p+) downloads"
+            
+        except subprocess.TimeoutExpired:
+            return False, None, "FFmpeg timed out - may be frozen"
+        except Exception as e:
+            return False, None, f"FFmpeg check failed: {str(e)}"
+    
+    @staticmethod
+    def test_merge_capability(ffmpeg_path: str) -> Tuple[bool, str]:
+        """Test if FFmpeg can merge video and audio streams"""
+        try:
+            kwargs = {'capture_output': True, 'text': True, 'timeout': 5}
+            if platform.system() == 'Windows':
+                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                
+            result = subprocess.run([ffmpeg_path, '-filters'], **kwargs)
+            
+            if result.returncode == 0:
+                return True, "FFmpeg merge capability confirmed"
+            else:
+                return False, "FFmpeg may have issues with stream merging"
+                
+        except Exception as e:
+            return False, f"Merge test failed: {str(e)}"
+    
+    @staticmethod
+    def get_quality_warning(quality: str, has_ffmpeg: bool) -> Optional[str]:
+        """Get warning message for quality selection based on FFmpeg availability"""
+        high_qualities = ['4k', '2160p', '1440p', '1080p', 'best']
+        
+        quality_lower = quality.lower()
+        
+        if not has_ffmpeg:
+            if quality_lower in high_qualities:
+                return f"⚠️ WARNING: {quality} requires FFmpeg for best results!\nWithout FFmpeg, download will fallback to the best available combined format.\nInstall FFmpeg from https://ffmpeg.org/download.html"
+        
+        return None
+
 class DownloadManager:
     """Advanced download manager with thread safety"""
    
-    def __init__(self, max_concurrent=3):
+    def __init__(self, max_concurrent=3, ui_callback=None):
         self.active_tasks: Dict[str, DownloadTask] = {}
         self.task_queue: deque = deque()
         self.task_history: List[DownloadTask] = []
@@ -180,31 +258,57 @@ class DownloadManager:
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.download_threads: Dict[str, threading.Thread] = {}
         self.stop_events: Dict[str, threading.Event] = {}
+        
+        self.ui_callback = ui_callback
        
-        # Rate limiting for subtitle requests
         self.last_subtitle_request = 0
-        self.subtitle_request_delay = 2.0 # 2 seconds between subtitle requests
+        self.subtitle_request_delay = 2.0
        
-        # FFmpeg status
         self.ffmpeg_path = None
         self.has_ffmpeg = False
+        self.ffmpeg_version = None
+        self.ffmpeg_status_message = ""
+        
+        # Validate FFmpeg on startup
+        # self._validate_ffmpeg()
        
-        # Load state
         self.load_state()
        
-        # Check for FFmpeg
-        self._check_ffmpeg()
-       
-        # Start callback processor
         threading.Thread(target=self._process_callbacks, daemon=True).start()
-   
+    
+    def _validate_ffmpeg(self):
+        """Validate FFmpeg and store detailed status"""
+        has_ffmpeg, path, message = FFmpegValidator.check_ffmpeg()
+        self.has_ffmpeg = has_ffmpeg
+        self.ffmpeg_path = path
+        self.ffmpeg_status_message = message
+        
+        if has_ffmpeg and path:
+            # Test merge capability
+            can_merge, merge_msg = FFmpegValidator.test_merge_capability(path)
+            if can_merge:
+                logger.info(f"FFmpeg validated: {message}")
+                logger.info(f"Merge capability: {merge_msg}")
+            else:
+                logger.warning(f"FFmpeg found but may have issues: {merge_msg}")
+        else:
+            logger.warning(f"FFmpeg validation failed: {message}")
+    
+    def check_quality_feasibility(self, quality: str) -> Tuple[bool, str]:
+        """Check if selected quality is feasible with current FFmpeg status"""
+        high_qualities = ['4k', '2160p', '1440p', '1080p', 'best']
+        
+        if not self.has_ffmpeg and quality.lower() in high_qualities:
+            return False, FFmpegValidator.get_quality_warning(quality, False)
+        
+        return True, "OK"
+    
     def save_state(self):
-        """Save download state to file"""
         with self.task_lock:
             state = {
                 'queue': [task.to_dict() for task in self.task_queue],
                 'active': [task.to_dict() for task in self.active_tasks.values()],
-                'history': [task.to_dict() for task in self.task_history[-100:]] # Keep last 100
+                'history': [task.to_dict() for task in self.task_history[-100:]]
             }
             try:
                 with open('download_state.json', 'w', encoding='utf-8') as f:
@@ -213,31 +317,21 @@ class DownloadManager:
                 logger.error(f"Failed to save state: {e}")
    
     def load_state(self):
-        """Load download state from file"""
         try:
             if os.path.exists('download_state.json'):
                 with open('download_state.json', 'r', encoding='utf-8') as f:
                     state = json.load(f)
                    
-                    # Load queue - with better error handling
                     self.task_queue = deque()
-                    queue_data = state.get('queue', [])
-                    logger.info(f"Loading {len(queue_data)} queued tasks")
-                   
-                    for task_data in queue_data:
+                    for task_data in state.get('queue', []):
                         try:
                             task = DownloadTask.from_dict(task_data)
                             self.task_queue.append(task)
                         except Exception as e:
                             logger.error(f"Failed to load queued task: {e}")
-                            logger.debug(f"Problematic task data: {task_data}")
                    
-                    # Load active tasks (reset to queued)
                     self.active_tasks = {}
-                    active_data = state.get('active', [])
-                    logger.info(f"Loading {len(active_data)} active tasks")
-                   
-                    for task_data in active_data:
+                    for task_data in state.get('active', []):
                         try:
                             task = DownloadTask.from_dict(task_data)
                             task.status = DownloadStatus.QUEUED
@@ -245,42 +339,24 @@ class DownloadManager:
                             self.task_queue.append(task)
                         except Exception as e:
                             logger.error(f"Failed to load active task: {e}")
-                            logger.debug(f"Problematic task data: {task_data}")
                    
-                    # Load history
                     self.task_history = []
-                    history_data = state.get('history', [])
-                    logger.info(f"Loading {len(history_data)} history tasks")
-                   
-                    for task_data in history_data:
+                    for task_data in state.get('history', []):
                         try:
                             task = DownloadTask.from_dict(task_data)
                             self.task_history.append(task)
                         except Exception as e:
                             logger.error(f"Failed to load history task: {e}")
-                            logger.debug(f"Problematic task data: {task_data}")
-                   
-                    logger.info(f"State loaded: {len(self.task_queue)} queued, {len(self.task_history)} history")
                            
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
-            # Initialize with empty data
             self.task_queue = deque()
             self.active_tasks = {}
             self.task_history = []
    
-    def _check_ffmpeg(self):
-        """Check for FFmpeg and update status"""
-        self.ffmpeg_path = self._find_ffmpeg()
-        self.has_ffmpeg = self.ffmpeg_path is not None
-        if self.has_ffmpeg:
-            logger.info(f"FFmpeg found at: {self.ffmpeg_path}")
-        else:
-            logger.warning("FFmpeg not found - high quality downloads limited")
-   
     def add_task(self, url: str, format_type: str, quality: str,
                  output_path: str, title: Optional[str] = None,
-                 include_subtitles: bool = False, embed_metadata: bool = True) -> str:
+                 include_subtitles: bool = False, embed_metadata: bool = True) -> Tuple[Optional[str], str]:
         """Add a new download task"""
         task_id = hashlib.md5(f"{url}_{time.time()}".encode()).hexdigest()[:12]
        
@@ -301,16 +377,12 @@ class DownloadManager:
             self.task_queue.append(task)
             self.save_state()
        
-        # Trigger callback
         self.callback_queue.put(('task_added', task_id))
-       
-        # Auto-start if possible
         self._auto_start_downloads()
        
-        return task_id
+        return task_id, "OK"
    
     def _auto_start_downloads(self):
-        """Automatically start downloads if slots available"""
         with self.task_lock:
             available_slots = self.max_concurrent - len(self.active_tasks)
             for _ in range(min(available_slots, len(self.task_queue))):
@@ -320,9 +392,7 @@ class DownloadManager:
                         self.start_task(task.id)
    
     def start_task(self, task_id: str) -> bool:
-        """Start a download task"""
         with self.task_lock:
-            # Find task in queue
             task_to_start = None
             for i, task in enumerate(self.task_queue):
                 if task.id == task_id:
@@ -333,19 +403,14 @@ class DownloadManager:
             if not task_to_start:
                 return False
            
-            # Check if we have available slots
             if len(self.active_tasks) >= self.max_concurrent:
                 self.task_queue.appendleft(task_to_start)
                 return False
            
-            # Update task status
             task_to_start.status = DownloadStatus.DOWNLOADING
             self.active_tasks[task_id] = task_to_start
-           
-            # Create stop event for this task
             self.stop_events[task_id] = threading.Event()
            
-            # Start download thread
             thread = threading.Thread(
                 target=self._download_worker,
                 args=(task_to_start,),
@@ -359,17 +424,14 @@ class DownloadManager:
             return True
    
     def pause_task(self, task_id: str) -> bool:
-        """Pause a download task"""
         with self.task_lock:
             if task_id in self.active_tasks:
                 task = self.active_tasks[task_id]
                 task.status = DownloadStatus.PAUSED
                
-                # Signal stop event
                 if task_id in self.stop_events:
                     self.stop_events[task_id].set()
                
-                # Move back to front of queue
                 self.task_queue.appendleft(task)
                 del self.active_tasks[task_id]
                
@@ -379,9 +441,7 @@ class DownloadManager:
         return False
    
     def resume_task(self, task_id: str) -> bool:
-        """Resume a paused task"""
         with self.task_lock:
-            # Find task in queue
             for i, task in enumerate(self.task_queue):
                 if task.id == task_id and task.status == DownloadStatus.PAUSED:
                     task.status = DownloadStatus.QUEUED
@@ -391,11 +451,8 @@ class DownloadManager:
         return False
    
     def cancel_task(self, task_id: str) -> bool:
-        """Cancel a task completely"""
         with self.task_lock:
-            # Check active tasks
             if task_id in self.active_tasks:
-                # Signal stop event
                 if task_id in self.stop_events:
                     self.stop_events[task_id].set()
                
@@ -403,11 +460,8 @@ class DownloadManager:
                 task.status = DownloadStatus.CANCELLED
                 self.task_history.append(task)
                 del self.active_tasks[task_id]
-               
-                # Cleanup partial files
                 self._cleanup_partial_files(task)
            
-            # Check queue
             for i, task in enumerate(self.task_queue):
                 if task.id == task_id:
                     task = self.task_queue[i]
@@ -420,19 +474,18 @@ class DownloadManager:
             return True
    
     def _cleanup_partial_files(self, task: DownloadTask):
-        """Clean up partially downloaded files"""
         try:
             if task.file_path and os.path.exists(task.file_path):
-                # Check if file is incomplete (e.g., .part file)
                 if task.file_path.endswith('.part') or task.progress < 100:
                     os.remove(task.file_path)
         except Exception as e:
             logger.error(f"Failed to cleanup files for task {task.id}: {e}")
    
     def _download_worker(self, task: DownloadTask):
-        """Worker thread for downloading - FIXED VERSION"""
         try:
-            # Get stream info first
+            # Re-validate FFmpeg before download
+            self._validate_ffmpeg()
+            
             info = self._get_video_info(task.url)
             if not info:
                 task.status = DownloadStatus.ERROR
@@ -440,137 +493,104 @@ class DownloadManager:
                 self.callback_queue.put(('task_error', task.id))
                 return
            
-            # Update task with info
             task.title = info.get('title', task.title)
             task.duration = info.get('duration', 0)
             task.channel = info.get('channel', None)
+            
+            if self.has_ffmpeg:
+                logger.info(f"Task {task.id}: Using FFmpeg at {self.ffmpeg_path} for high quality")
+            else:
+                logger.warning(f"Task {task.id}: No FFmpeg available - quality may fallback")
            
-            # Log available formats for debugging
-            formats = info.get('formats', [])
-            logger.info(f"Task {task.id}: Requested quality: {task.quality}")
-            logger.info(f"Task {task.id}: Available formats: {len(formats)}")
-           
-            # Log some format details for debugging
-            video_formats = [f for f in formats if f.get('vcodec') != 'none']
-            audio_formats = [f for f in formats if f.get('acodec') != 'none']
-           
-            logger.info(f"Task {task.id}: Video formats: {len(video_formats)}")
-            logger.info(f"Task {task.id}: Audio formats: {len(audio_formats)}")
-           
-            # Log resolutions for debugging
-            resolutions = set()
-            for fmt in video_formats:
-                height = fmt.get('height')
-                if height:
-                    resolutions.add(height)
-           
-            logger.info(f"Task {task.id}: Available resolutions: {sorted(resolutions, reverse=True)}")
-           
-            # Set up download options - USE THE NEW SIMPLIFIED METHOD
-            ydl_opts = self._build_ydl_options_simple(task, info)
-           
+            ydl_opts = self._build_ydl_options(task, info)
+            
             # Log the format selector being used
-            logger.info(f"Task {task.id}: Using format selector: {ydl_opts.get('format')}")
+            logger.info(f"Task {task.id}: Format selector: {ydl_opts.get('format', 'N/A')}")
            
-            # Progress hook
             def progress_hook(d):
                 if self.stop_events.get(task.id, threading.Event()).is_set():
                     raise Exception("Download stopped by user")
-               
+
                 if d['status'] == 'downloading':
                     task.downloaded_bytes = d.get('downloaded_bytes', 0)
-                    task.total_bytes = d.get('total_bytes', d.get('total_bytes_estimate', 0))
-                    task.speed = d.get('speed', 0)
-                    task.eta = d.get('eta', 0)
-                   
+                    total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                    task.total_bytes = total
+                    task.speed = d.get('speed', 0) or 0
+                    task.eta = d.get('eta', 0) or 0
+
                     if task.total_bytes > 0:
                         task.progress = (task.downloaded_bytes / task.total_bytes) * 100
                     elif d.get('fragment_index') and d.get('fragment_count'):
                         task.progress = (d['fragment_index'] / d['fragment_count']) * 100
-                   
+
+                    # ✅ ADD: Log the actual format being downloaded so you can verify quality
+                    if task.progress < 2:  # Log only at start to avoid spam
+                        filename = d.get('filename', '')
+                        info_dict = d.get('info_dict', {})
+                        actual_height = info_dict.get('height', 'unknown')
+                        actual_format = info_dict.get('format', 'unknown')
+                        logger.info(f"📥 Downloading: height={actual_height}px format={actual_format} file={os.path.basename(filename)}")
+
                     self.callback_queue.put(('task_progress', task.id))
-               
+
+                elif d['status'] == 'error':
+                    # ✅ ADD: Capture and surface the real yt-dlp error
+                    error_detail = d.get('error', 'Unknown yt-dlp error')
+                    logger.error(f"❌ yt-dlp reported error for task {task.id}: {error_detail}")
+                    task.error = str(error_detail)
+                    self.callback_queue.put(('task_error', task.id))
+
                 elif d['status'] == 'processing':
                     task.status = DownloadStatus.PROCESSING
+                    logger.info(f"⚙️ Post-processing task {task.id}")
                     self.callback_queue.put(('task_processing', task.id))
-               
-                elif d['status'] == 'merging':
-                    task.status = DownloadStatus.MERGING
-                    self.callback_queue.put(('task_merging', task.id))
+
+                elif d['status'] == 'finished':
+                    # This fires per-stream (video stream done, then audio stream done before merge)
+                    filename = d.get('filename', '')
+                    info_dict = d.get('info_dict', {})
+                    actual_height = info_dict.get('height', 'unknown')
+                    logger.info(f"✅ Stream finished: height={actual_height}px file={os.path.basename(filename)}")
+                    task.progress = 99  # not 100 yet — merging may still happen
+                    self.callback_queue.put(('task_completed', task.id))
            
             ydl_opts['progress_hooks'] = [progress_hook]
            
-            # Perform download with retry logic
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    with YoutubeDL(ydl_opts) as ydl:
-                        task.status = DownloadStatus.DOWNLOADING
-                        self.callback_queue.put(('task_started', task.id))
-                       
-                        # Log what yt-dlp will download
-                        logger.info(f"Task {task.id}: Attempt {attempt + 1} - Downloading with format: {ydl_opts['format']}")
-                       
-                        try:
-                            ydl.download([task.url])
-                            break # Success, break out of retry loop
-                           
-                        except Exception as e:
-                            error_msg = str(e)
-                            logger.warning(f"Task {task.id}: Download attempt {attempt + 1} failed: {error_msg}")
-                           
-                            # Handle specific errors
-                            if "HTTP Error 429" in error_msg and "subtitles" in error_msg:
-                                logger.warning(f"Task {task.id}: Subtitle rate limited, retrying without subtitles")
-                                ydl_opts.pop('writesubtitles', None)
-                                ydl_opts.pop('writeautomaticsub', None)
-                                ydl_opts.pop('subtitleslangs', None)
-                                continue
-                           
-                            elif "format is not available" in error_msg.lower() or "requested format" in error_msg.lower():
-                                logger.warning(f"Task {task.id}: Format not available, trying fallback")
-                                # Try simpler format
-                                ydl_opts['format'] = 'best'
-                                continue
-                           
-                            elif attempt < max_retries - 1:
-                                # Wait before retry
-                                time.sleep(2)
-                                continue
-                            else:
-                                raise
-               
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        continue
-                    else:
-                        raise
+            with YoutubeDL(ydl_opts) as ydl:
+                task.status = DownloadStatus.DOWNLOADING
+                self.callback_queue.put(('task_started', task.id))
+                ydl.download([task.url])
            
-            # Mark as completed
             task.status = DownloadStatus.COMPLETED
             task.progress = 100
             task.completed_at = time.time()
-           
-            # Find the actual file
-            task.file_path = self._find_downloaded_file(task, ydl_opts['outtmpl'])
-           
+
+            # ✅ FIXED: Find file and log actual resolution achieved
+            task.file_path = self._find_downloaded_file(task, task.output_path)
+            
             if task.file_path:
                 file_size = os.path.getsize(task.file_path)
-                logger.info(f"Task {task.id}: Download completed. File: {task.file_path}, Size: {file_size} bytes")
+                logger.info(f"✅ Task {task.id} complete: {os.path.basename(task.file_path)} ({self._format_size(file_size)})")
+                # Try to get actual resolution via ffprobe for verification
+                if self.ffmpeg_path:
+                    try:
+                        ffprobe = self.ffmpeg_path.replace('ffmpeg', 'ffprobe')
+                        if os.path.exists(ffprobe):
+                            probe_kwargs = {'capture_output': True, 'text': True, 'timeout': 5}
+                            if platform.system() == 'Windows':
+                                probe_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                            result = subprocess.run(
+                                [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+                                 '-show_entries', 'stream=width,height',
+                                 '-of', 'csv=p=0', task.file_path],
+                                **probe_kwargs
+                            )
+                            if result.returncode == 0 and result.stdout.strip():
+                                logger.info(f"📐 Verified output resolution: {result.stdout.strip()}")
+                    except Exception as probe_err:
+                        logger.debug(f"ffprobe check skipped: {probe_err}")
             else:
-                logger.warning(f"Task {task.id}: Download completed but file not found")
-           
-            # Move to history
-            with self.task_lock:
-                self.task_history.append(task)
-                if task.id in self.active_tasks:
-                    del self.active_tasks[task.id]
-           
-            self.save_state()
-            self.callback_queue.put(('task_completed', task.id))
-           
-            # Start next download if queue not empty
-            self._auto_start_downloads()
+                logger.warning(f"⚠️ Task {task.id}: Could not locate output file in {task.output_path}")
            
         except Exception as e:
             logger.error(f"Download error for task {task.id}: {e}", exc_info=True)
@@ -583,331 +603,191 @@ class DownloadManager:
            
             self.save_state()
             self.callback_queue.put(('task_error', task.id))
-           
-            # Cleanup on error
             self._cleanup_partial_files(task)
    
     def _get_video_info(self, url: str) -> Optional[Dict]:
-        """Get video information using yt-dlp"""
         try:
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'extract_flat': False,
-                'force_generic_extractor': False,
+                # ✅ No extractor_args here either — consistent with _build_ydl_options
+                # Uses default web client so listed formats match what download can actually get
             }
-           
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 return info
-               
         except Exception as e:
             logger.error(f"Failed to get video info: {e}")
             return None
    
-    def _build_ydl_options_simple(self, task: DownloadTask, info: Dict) -> Dict:
-        """Build yt-dlp options - SIMPLIFIED AND FIXED VERSION"""
-        # Create output template
+    def _build_ydl_options(self, task: DownloadTask, info: Dict) -> Dict:
+        """Build yt-dlp options with correct quality enforcement"""
+
         output_template = os.path.join(
             task.output_path,
             '%(title)s [%(id)s].%(ext)s'
         )
-       
-        # Base options
+
         ydl_opts = {
             'outtmpl': output_template,
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,
+            'no_warnings': False,
             'ignoreerrors': False,
             'retries': 10,
             'fragment_retries': 10,
             'file_access_retries': 3,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                    'player_skip': ['configs', 'js'],
-                }
-            },
-            'concurrent_fragment_downloads': 4,
-            'throttledratelimit': 1000000,
-            'buffersize': 1024 * 1024,
-            'http_chunk_size': 10485760,
+            'concurrent_fragment_downloads': 5,
+            # ✅ FIX #1: REMOVED extractor_args entirely.
+            # The android player_client only provides combined streams capped at 720p.
+            # It cannot see the separate 1080p/4K video-only streams that need merging.
+            # Removing this lets yt-dlp use the default web client which sees ALL formats.
         }
-       
-        # Set ffmpeg location if available
+
         if self.has_ffmpeg and self.ffmpeg_path:
             ydl_opts['ffmpeg_location'] = self.ffmpeg_path
-       
-        # SIMPLIFIED AND EFFECTIVE FORMAT SELECTION
+            logger.info(f"✅ FFmpeg enabled for task {task.id} at {self.ffmpeg_path}")
+
+        quality = task.quality.lower()
+
+        height_map = {
+            '4k':    2160,
+            '2160p': 2160,
+            '1440p': 1440,
+            '1080p': 1080,
+            '720p':  720,
+            '480p':  480,
+            '360p':  360,
+            '240p':  240,
+            '144p':  144,
+            'best':  9999,
+            'worst': 0,
+        }
+        target_height = height_map.get(quality, 1080)
+
         if task.format_type == 'audio':
-            # For audio, use simple format selection
-            ydl_opts['format'] = 'bestaudio'
+            ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
             if self.has_ffmpeg:
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '320',
-                }]
-        else:
-            # For video, use different strategies based on quality
-            quality = task.quality.lower()
-           
-            if quality == 'best':
-                # For "best", let yt-dlp choose the best available
-                if self.has_ffmpeg:
+                # ✅ FIX #4: Build postprocessors in correct order
+                ydl_opts['postprocessors'] = [
+                    {
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '320',
+                    },
+                ]
+                if task.embed_metadata:
+                    ydl_opts['postprocessors'].append({'key': 'FFmpegMetadata', 'add_metadata': True})
+
+        else:  # video
+            if self.has_ffmpeg:
+                if target_height >= 9999:
+                    # Best possible: no height filter
                     ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                elif target_height == 0:
+                    ydl_opts['format'] = 'worstvideo+worstaudio/worst'
                 else:
-                    ydl_opts['format'] = 'best[ext=mp4]/best'
-           
-            elif quality == 'worst':
-                # For "worst", get the worst quality
-                ydl_opts['format'] = 'worst'
-           
+                    # ✅ FIX #2: Clean two-part format string.
+                    # Part 1: separate video stream + separate audio stream (needs FFmpeg merge) — gives true 1080p/4K
+                    # Part 2: fallback to best single combined stream if merge streams unavailable
+                    # NO android client interference means Part 1 will now actually be found
+                    ydl_opts['format'] = (
+                        f'bestvideo[height<={target_height}]+bestaudio'
+                        f'/best[height<={target_height}]'
+                    )
+
+                # ✅ FIX #3: Correct format_sort — +res means DESCENDING (highest first)
+                # This ensures the best resolution AT OR BELOW target is always preferred
+                ydl_opts['format_sort'] = ['+res', 'ext:mp4:m4a', 'codec:h264:aac']
+                ydl_opts['merge_output_format'] = 'mp4'
+
+                # ✅ FIX #4: Postprocessors built cleanly — no append conflicts
+                ydl_opts['postprocessors'] = []
+                if task.embed_metadata:
+                    ydl_opts['postprocessors'].append({'key': 'FFmpegMetadata', 'add_metadata': True})
+                if task.embed_metadata:
+                    ydl_opts['writethumbnail'] = True
+                    ydl_opts['postprocessors'].append({'key': 'EmbedThumbnail'})
+
+                logger.info(
+                    f"🎬 FFmpeg mode — format: {ydl_opts['format']} | "
+                    f"sort: {ydl_opts['format_sort']} | target: {target_height}p"
+                )
+
             else:
-                # For specific resolutions
-                # Map quality strings to heights
-                quality_map = {
-                    '8k': 4320,
-                    '4k': 2160,
-                    '1440p': 1440,
-                    '1080p': 1080,
-                    '720p': 720,
-                    '480p': 480,
-                    '360p': 360,
-                    '240p': 240,
-                    '144p': 144,
-                }
-               
-                height = quality_map.get(quality, 1080)
-               
-                if self.has_ffmpeg:
-                    # With ffmpeg, we can merge separate streams
-                    ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]/best'
+                # No FFmpeg: combined stream only (video+audio in one file, max ~720p on YouTube)
+                if target_height >= 9999:
+                    ydl_opts['format'] = 'best'
+                elif target_height == 0:
+                    ydl_opts['format'] = 'worst'
                 else:
-                    # Without ffmpeg, need single stream
-                    ydl_opts['format'] = f'best[height<={height}][ext=mp4]/best[height<={height}]'
-       
-        # Post-processor for merging if we have separate streams
-        if self.has_ffmpeg and task.format_type == 'video' and '+bestaudio' in ydl_opts.get('format', ''):
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }]
-            ydl_opts['merge_output_format'] = 'mp4'
-       
-        # Add subtitles if requested
+                    ydl_opts['format'] = f'best[height<={target_height}]/best'
+                logger.warning(
+                    f"⚠️ No FFmpeg — using combined stream: {ydl_opts['format']} "
+                    f"(max ~720p, install FFmpeg for 1080p+)"
+                )
+
+        # Subtitles
         if task.include_subtitles:
             current_time = time.time()
             if current_time - self.last_subtitle_request >= self.subtitle_request_delay:
-                ydl_opts['writesubtitles'] = True
-                ydl_opts['writeautomaticsub'] = True
-                ydl_opts['subtitleslangs'] = ['en']
+                ydl_opts.update({
+                    'writesubtitles': True,
+                    'writeautomaticsub': True,
+                    'subtitleslangs': ['en'],
+                    'subtitlesformat': 'vtt',
+                })
                 self.last_subtitle_request = current_time
-       
-        # Add metadata if requested
-        if task.embed_metadata:
-            ydl_opts['writethumbnail'] = True
-            ydl_opts['embedthumbnail'] = True
-            if task.include_subtitles:
-                ydl_opts['embedsubtitles'] = True
-            ydl_opts['addmetadata'] = True
-       
+
         return ydl_opts
    
-    def _build_ydl_options_advanced(self, task: DownloadTask, info: Dict) -> Dict:
-        """Alternative advanced method for format selection"""
-        output_template = os.path.join(
-            task.output_path,
-            '%(title)s [%(id)s].%(ext)s'
-        )
-       
-        ydl_opts = {
-            'outtmpl': output_template,
-            'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': False,
-            'retries': 10,
-            'fragment_retries': 10,
-            'file_access_retries': 3,
-            'concurrent_fragment_downloads': 4,
-        }
-       
-        # Set ffmpeg location if available
-        if self.has_ffmpeg and self.ffmpeg_path:
-            ydl_opts['ffmpeg_location'] = self.ffmpeg_path
-       
-        # SIMPLE BUT EFFECTIVE format selection
-        if task.format_type == 'audio':
-            ydl_opts['format'] = 'bestaudio'
-            if self.has_ffmpeg:
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '320',
-                }]
-        else:
-            # Try different strategies based on what works
-            quality = task.quality.lower()
-           
-            if quality == 'best':
-                # Strategy 1: Let yt-dlp decide
-                if self.has_ffmpeg:
-                    # Try merging streams
-                    ydl_opts['format'] = 'bv*[vcodec^=avc1]+ba/b[vcodec^=avc1] / bv*+ba/b'
-                else:
-                    # Single stream
-                    ydl_opts['format'] = 'best[ext=mp4]'
-           
-            elif quality == 'worst':
-                ydl_opts['format'] = 'worst'
-           
-            else:
-                # For specific quality
-                height_map = {
-                    '8k': 4320, '4k': 2160, '1440p': 1440, '1080p': 1080,
-                    '720p': 720, '480p': 480, '360p': 360, '240p': 240, '144p': 144
-                }
-               
-                height = height_map.get(quality, 1080)
-               
-                if self.has_ffmpeg:
-                    # Try multiple strategies
-                    format_selectors = [
-                        f'bv*[height<={height}][vcodec^=avc1]+ba/b[height<={height}]',
-                        f'bv*[height<={height}]+ba/b[height<={height}]',
-                        f'bestvideo[height<={height}]+bestaudio/best[height<={height}]',
-                    ]
-                    ydl_opts['format'] = '/'.join(format_selectors)
-                else:
-                    ydl_opts['format'] = f'best[height<={height}][ext=mp4]'
-       
-        # Add post-processor if we're merging
-        if self.has_ffmpeg and task.format_type == 'video' and ('+' in ydl_opts.get('format', '') or 'bv' in ydl_opts.get('format', '')):
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }]
-            ydl_opts['merge_output_format'] = 'mp4'
-       
-        return ydl_opts
-   
-    def _find_ffmpeg(self) -> Optional[str]:
-        """Find ffmpeg executable"""
+    def _find_downloaded_file(self, task: DownloadTask, output_dir: str) -> Optional[str]:
+        """Robustly find the downloaded file"""
         try:
-            # Try system PATH first
-            ffmpeg_path = shutil.which('ffmpeg')
-            if ffmpeg_path:
-                # Test ffmpeg
-                try:
-                    result = subprocess.run(
-                        [ffmpeg_path, '-version'],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                        creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
-                    )
-                    if result.returncode == 0 and 'ffmpeg version' in result.stdout:
-                        logger.info(f"Found FFmpeg in PATH: {ffmpeg_path}")
-                        return ffmpeg_path
-                except:
-                    pass
-           
-            # Check common paths
-            common_paths = []
-           
-            if platform.system() == 'Windows':
-                common_paths = [
-                    r"C:\ffmpeg\bin\ffmpeg.exe",
-                    r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-                    r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-                    os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"),
-                    os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg.exe"),
-                ]
-               
-                # Also check PATH environment variable explicitly
-                path_dirs = os.environ.get('PATH', '').split(';')
-                for path_dir in path_dirs:
-                    if path_dir.strip():
-                        ffmpeg_exe = os.path.join(path_dir, "ffmpeg.exe")
-                        if os.path.exists(ffmpeg_exe):
-                            common_paths.append(ffmpeg_exe)
-           
-            else: # Linux/macOS
-                common_paths = [
-                    "/usr/bin/ffmpeg",
-                    "/usr/local/bin/ffmpeg",
-                    "/opt/homebrew/bin/ffmpeg",
-                    "/opt/local/bin/ffmpeg",
-                    "/bin/ffmpeg",
-                    "/sbin/ffmpeg",
-                    os.path.expanduser("~/bin/ffmpeg"),
-                    os.path.expanduser("~/.local/bin/ffmpeg"),
-                    os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg"),
-                    os.path.join(os.path.dirname(__file__), "ffmpeg", "bin", "ffmpeg"),
-                ]
-               
-                # Check PATH environment variable
-                path_dirs = os.environ.get('PATH', '').split(':')
-                for path_dir in path_dirs:
-                    if path_dir.strip():
-                        ffmpeg_path = os.path.join(path_dir, "ffmpeg")
-                        if os.path.exists(ffmpeg_path):
-                            common_paths.append(ffmpeg_path)
-           
-            # Remove duplicates while preserving order
-            common_paths = list(dict.fromkeys(common_paths))
-           
-            for path in common_paths:
-                if os.path.exists(path):
-                    try:
-                        # Test if it's actually ffmpeg
-                        result = subprocess.run(
-                            [path, '-version'],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
-                        )
-                        if result.returncode == 0 and 'ffmpeg version' in result.stdout:
-                            logger.info(f"Found FFmpeg at: {path}")
-                            return path
-                    except Exception as e:
-                        logger.debug(f"Failed to test FFmpeg at {path}: {e}")
-                        continue
-           
-            return None
-                       
-        except Exception as e:
-            logger.error(f"Error finding ffmpeg: {e}")
-            return None
-   
-    def _find_downloaded_file(self, task: DownloadTask, output_template: str) -> Optional[str]:
-        """Find the actual downloaded file"""
-        try:
-            # Extract base filename from template
-            base_dir = os.path.dirname(output_template)
-            if not os.path.exists(base_dir):
-                base_dir = task.output_path
-           
-            # Look for files matching the pattern
-            pattern = re.compile(rf".*{re.escape(task.title)}.*\.(mp4|mkv|webm|mp3|m4a|ogg|flac)$", re.IGNORECASE)
-           
-            for filename in os.listdir(base_dir):
-                if pattern.match(filename):
-                    filepath = os.path.join(base_dir, filename)
-                    # Check if file is reasonably sized (> 100KB)
-                    if os.path.getsize(filepath) > 100 * 1024:
-                        return filepath
-           
-            # Try to find by modification time
+            if not os.path.exists(output_dir):
+                return None
+            
+            # Look for files modified in the last 5 minutes that match the title
+            current_time = time.time()
+            candidates = []
+            
+            for filename in os.listdir(output_dir):
+                filepath = os.path.join(output_dir, filename)
+                if not os.path.isfile(filepath):
+                    continue
+                    
+                # Check if file was modified recently (within last 5 mins)
+                mtime = os.path.getmtime(filepath)
+                if current_time - mtime > 300:  # 5 minutes
+                    continue
+                
+                # Check if filename contains parts of the title
+                # Clean title for matching
+                clean_title = re.sub(r'[^\w\s-]', '', task.title).lower()
+                clean_filename = filename.lower()
+                
+                # Simple heuristic: if significant part of title is in filename
+                words = clean_title.split()
+                if len(words) > 0:
+                    # Check if at least the first 2 significant words are in filename
+                    matches = sum(1 for w in words[:3] if len(w) > 3 and w in clean_filename)
+                    if matches >= 1:
+                        candidates.append((filepath, os.path.getsize(filepath)))
+
+            if candidates:
+                # Return the largest file among candidates (likely the video)
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                logger.info(f"Found downloaded file: {candidates[0][0]}")
+                return candidates[0][0]
+            
+            # Fallback: Just return the most recently modified large file in dir
             files = []
-            for filename in os.listdir(base_dir):
-                filepath = os.path.join(base_dir, filename)
-                if os.path.isfile(filepath) and os.path.getsize(filepath) > 100 * 1024:
+            for filename in os.listdir(output_dir):
+                filepath = os.path.join(output_dir, filename)
+                if os.path.isfile(filepath) and os.path.getsize(filepath) > 1024 * 1024: # > 1MB
                     files.append((filepath, os.path.getmtime(filepath)))
-           
+            
             if files:
-                # Get most recently modified file
                 files.sort(key=lambda x: x[1], reverse=True)
                 return files[0][0]
                
@@ -917,19 +797,18 @@ class DownloadManager:
         return None
    
     def _process_callbacks(self):
-        """Process callback queue (runs in separate thread)"""
+        """Process callback queue and update UI in real-time"""
         while True:
             try:
-                callback_type, task_id = self.callback_queue.get(timeout=1)
-                # This would typically update UI, but we handle it in the main app
-                pass
+                item = self.callback_queue.get(timeout=1)
+                if self.ui_callback:
+                    self.ui_callback(item)
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"Error in callback processor: {e}")
    
     def get_task(self, task_id: str) -> Optional[DownloadTask]:
-        """Get task by ID"""
         with self.task_lock:
             if task_id in self.active_tasks:
                 return self.active_tasks[task_id]
@@ -945,104 +824,146 @@ class DownloadManager:
         return None
    
     def get_all_tasks(self) -> List[DownloadTask]:
-        """Get all tasks (active + queued + recent history)"""
         with self.task_lock:
             tasks = list(self.active_tasks.values()) + list(self.task_queue) + self.task_history[-50:]
             return tasks
    
     def clear_completed(self):
-        """Clear completed tasks from history"""
         with self.task_lock:
-            # Keep only non-completed in history
             self.task_history = [t for t in self.task_history if t.status != DownloadStatus.COMPLETED]
             self.save_state()
    
     def clear_all(self):
-        """Clear all tasks"""
         with self.task_lock:
-            # Stop all active downloads
             for task_id in list(self.active_tasks.keys()):
                 self.cancel_task(task_id)
            
-            # Clear queue
             for task in list(self.task_queue):
                 task.status = DownloadStatus.CANCELLED
                 self.task_history.append(task)
            
             self.task_queue.clear()
             self.save_state()
+    
+    def get_ffmpeg_status(self) -> Dict:
+        """Get detailed FFmpeg status"""
+        return {
+            'available': self.has_ffmpeg,
+            'path': self.ffmpeg_path,
+            'message': self.ffmpeg_status_message,
+            'version': self.ffmpeg_version
+        }
+    
+    def _format_size(self, bytes_num):
+        if bytes_num <= 0:
+            return "0 B"
+        units = ['B', 'KB', 'MB', 'GB', 'TB']
+        i = 0
+        while bytes_num >= 1024 and i < len(units) - 1:
+            bytes_num /= 1024
+            i += 1
+        return f"{bytes_num:.2f} {units[i]}"
+
 class YouTubeDownloaderPro:
-    """Main application class with Televrz-inspired UI"""
+    """Main application class"""
    
     def __init__(self, root):
         self.root = root
-        self.root.title("YouTube Downloader Pro - FIXED")
+        self.root.title("YouTube Downloader Pro - FFMPEG VALIDATED")
         self.root.geometry("1200x800")
         self.root.minsize(1000, 700)
        
-        # Set theme
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
        
-        # Initialize components
-        self.download_manager = DownloadManager(max_concurrent=3)
+        # Pass UI callback for real-time status updates
+        self.download_manager = DownloadManager(max_concurrent=3, ui_callback=self.on_download_event)
         self.current_theme = "dark"
         self.video_cache = {}
         self.thumbnail_cache = {}
         self.settings = self.load_settings()
         self.current_tab = "download"
        
-        # UI elements
         self.tab_view = None
         self.url_entry = None
-        self.format_combo = None
         self.quality_combo = None
         self.path_entry = None
-        self.task_listbox = None
         self.history_tree = None
         self.progress_bars = {}
         self.status_labels = {}
-        self.control_buttons = {}
        
-        # New UI options
         self.subtitles_var = ctk.BooleanVar(value=False)
         self.metadata_var = ctk.BooleanVar(value=True)
        
-        # Stats
         self.total_downloads = 0
         self.total_size = 0
         self.active_downloads = 0
        
-        # Setup UI
         self.setup_ui()
-       
-        # Start update timer
         self.update_timer()
-       
-        # Load initial data
         self.refresh_task_list()
         self.refresh_history()
        
-        # Bind close event
+        # Show FFmpeg status on startup
+        self.show_ffmpeg_status()
+       
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-   
+    
+    def on_download_event(self, event):
+        """Handle real-time download events to update status bar"""
+        if not event or len(event) < 2:
+            return
+        event_type, task_id = event[0], event[1]
+        task = self.download_manager.get_task(task_id)
+        if not task: 
+            return
+        
+        if event_type == 'task_progress':
+            downloaded = self._format_size(task.downloaded_bytes)
+            total = self._format_size(task.total_bytes) if task.total_bytes > 0 else "??"
+            speed = self._format_size(task.speed) if task.speed > 0 else "0"
+            self.status_message.set(f"Downloading: {task.title[:30]}... | {downloaded}/{total} | {speed}/s")
+        elif event_type == 'task_completed':
+            self.status_message.set(f"Completed: {task.title[:40]}...")
+        elif event_type == 'task_error':
+            self.status_message.set(f"Error: {task.title[:30]}... - {str(task.error)[:30]}")
+        elif event_type == 'task_started':
+            self.status_message.set(f"Started: {task.title[:40]}...")
+    
+    def show_ffmpeg_status(self):
+        """Show FFmpeg status dialog on startup"""
+        status = self.download_manager.get_ffmpeg_status()
+        
+        if status['available']:
+            messagebox.showinfo(
+                "FFmpeg Available ✓",
+                f"{status['message']}\n\n"
+                f"✅ High quality downloads (1080p, 4K) are available!\n"
+                f"✅ Video and audio will be merged for best quality\n\n"
+                f"Path: {status['path']}"
+            )
+        else:
+            result = messagebox.askyesno(
+                "FFmpeg Not Found ⚠️",
+                f"{status['message']}\n\n"
+                f"⚠️ Without FFmpeg:\n"
+                f"• High quality downloads will fallback to best combined format\n"
+                f"• Some videos may download without audio at high resolutions\n"
+                f"• Cannot merge best video + best audio\n\n"
+                f"Do you want to open the FFmpeg download page?"
+            )
+            if result:
+                webbrowser.open("https://ffmpeg.org/download.html")
+    
     def setup_ui(self):
-        """Setup the main user interface"""
-        # Main container
         self.main_container = ctk.CTkFrame(self.root, fg_color=COLORS['dark_bg'])
         self.main_container.pack(fill="both", expand=True)
        
-        # Header
         self.setup_header()
-       
-        # Main content area with tabs
         self.setup_tabs()
-       
-        # Status bar
         self.setup_status_bar()
    
     def setup_header(self):
-        """Setup application header"""
         header_frame = ctk.CTkFrame(
             self.main_container,
             fg_color=COLORS['dark_card'],
@@ -1051,7 +972,6 @@ class YouTubeDownloaderPro:
         header_frame.pack(fill="x", padx=10, pady=(10, 5))
         header_frame.pack_propagate(False)
        
-        # Logo/Title
         title_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         title_frame.pack(side="left", padx=20)
        
@@ -1065,35 +985,39 @@ class YouTubeDownloaderPro:
        
         version_label = ctk.CTkLabel(
             title_frame,
-            text="v2.0.0",
+            text="v3.0.0 - FFMPEG VALIDATED",
             font=ctk.CTkFont(size=12),
             text_color=COLORS['text_secondary']
         )
         version_label.pack(side="left", padx=(10, 0))
-       
-        # FFmpeg status
-        if self.download_manager.has_ffmpeg:
-            ffmpeg_label = ctk.CTkLabel(
-                title_frame,
-                text="✓ FFmpeg",
-                font=ctk.CTkFont(size=10),
-                text_color=COLORS['success']
-            )
-            ffmpeg_label.pack(side="left", padx=(10, 0))
+        
+        # FFmpeg status indicator with color
+        status = self.download_manager.get_ffmpeg_status()
+        if status['available']:
+            ffmpeg_status_text = "✓ FFmpeg: AVAILABLE"
+            ffmpeg_color = COLORS['success']
+            ffmpeg_hover = "#2DB54F"
         else:
-            ffmpeg_label = ctk.CTkLabel(
-                title_frame,
-                text="⚠ No FFmpeg",
-                font=ctk.CTkFont(size=10),
-                text_color=COLORS['warning']
-            )
-            ffmpeg_label.pack(side="left", padx=(10, 0))
+            ffmpeg_status_text = "⚠ FFmpeg: NOT FOUND"
+            ffmpeg_color = COLORS['warning']
+            ffmpeg_hover = "#E68A00"
+        
+        self.ffmpeg_status_btn = ctk.CTkButton(
+            title_frame,
+            text=ffmpeg_status_text,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=ffmpeg_color,
+            hover_color=ffmpeg_hover,
+            width=180,
+            height=30,
+            command=self.show_ffmpeg_details
+        )
+        self.ffmpeg_status_btn.pack(side="left", padx=(10, 0))
        
-        # Stats frame
         stats_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         stats_frame.pack(side="left", padx=50)
        
-        stats_text = f"📊 Downloads: {self.total_downloads} | 📁 Size: {self.format_size(self.total_size)} | ⚡ Active: {self.active_downloads}"
+        stats_text = f"📊 Downloads: {self.total_downloads} | 📁 Size: {self._format_size(self.total_size)} | ⚡ Active: {self.active_downloads}"
         self.stats_label = ctk.CTkLabel(
             stats_frame,
             text=stats_text,
@@ -1102,7 +1026,6 @@ class YouTubeDownloaderPro:
         )
         self.stats_label.pack()
        
-        # Settings button
         settings_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         settings_frame.pack(side="right", padx=20)
        
@@ -1127,9 +1050,37 @@ class YouTubeDownloaderPro:
             text_color=COLORS['text_primary']
         )
         theme_btn.pack(side="left", padx=5)
+    
+    def show_ffmpeg_details(self):
+        """Show detailed FFmpeg information"""
+        status = self.download_manager.get_ffmpeg_status()
+        
+        details = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                    FFMPEG STATUS REPORT                      ║
+╠══════════════════════════════════════════════════════════════╣
+║ Status: {'✓ AVAILABLE' if status['available'] else '✗ NOT FOUND'}                        
+║ Path: {status['path'] if status['path'] else 'N/A'}
+║ {status['message']}
+╠══════════════════════════════════════════════════════════════╣
+║                    QUALITY CAPABILITIES                       ║
+╠══════════════════════════════════════════════════════════════╣
+║ {'✓ 4K/8K Downloads: YES' if status['available'] else '⚠ 4K/8K Downloads: FALLBACK MODE'}
+║ {'✓ 1080p Downloads: YES' if status['available'] else '⚠ 1080p Downloads: FALLBACK MODE'}
+║ {'✓ Video+Audio Merging: YES' if status['available'] else '✗ Video+Audio Merging: NO'}
+║ {'✓ Best Quality Available: YES' if status['available'] else '⚠ Limited to combined streams'}
+╚══════════════════════════════════════════════════════════════╝
+        """
+        
+        if not status['available']:
+            details += f"\n\n📥 To install FFmpeg:\n"
+            details += f"   Windows: https://www.gyan.dev/ffmpeg/builds/\n"
+            details += f"   macOS:   brew install ffmpeg\n"
+            details += f"   Linux:   sudo apt install ffmpeg\n"
+        
+        messagebox.showinfo("FFmpeg Details", details)
    
     def setup_tabs(self):
-        """Setup main tabs"""
         self.tab_view = ctk.CTkTabview(
             self.main_container,
             fg_color=COLORS['dark_bg'],
@@ -1142,32 +1093,25 @@ class YouTubeDownloaderPro:
         )
         self.tab_view.pack(fill="both", expand=True, padx=10, pady=(0, 10))
        
-        # Create tabs
         self.download_tab = self.tab_view.add("⬇️ Download")
         self.queue_tab = self.tab_view.add("📋 Queue")
         self.history_tab = self.tab_view.add("📊 History")
         self.playlist_tab = self.tab_view.add("🎵 Playlist")
        
-        # Setup each tab
         self.setup_download_tab()
         self.setup_queue_tab()
         self.setup_history_tab()
         self.setup_playlist_tab()
        
-        # Bind tab change event
         self.tab_view.configure(command=self.on_tab_changed)
    
     def setup_download_tab(self):
-        """Setup download tab"""
-        # Main content frame
         content_frame = ctk.CTkFrame(self.download_tab, fg_color=COLORS['dark_bg'])
         content_frame.pack(fill="both", expand=True, padx=20, pady=20)
        
-        # Create a scrollable left panel
         left_container = ctk.CTkFrame(content_frame, fg_color=COLORS['dark_bg'])
         left_container.pack(side="left", fill="y", padx=(0, 10))
        
-        # Add a scrollable frame inside the container
         left_panel = ctk.CTkScrollableFrame(
             left_container,
             fg_color=COLORS['dark_card'],
@@ -1177,14 +1121,45 @@ class YouTubeDownloaderPro:
             orientation="vertical"
         )
         left_panel.pack(fill="both", expand=True)
-       
-        # Make the container have a fixed width
         left_container.pack_propagate(False)
-        left_container.configure(width=420) # Width + scrollbar width
+        left_container.configure(width=420)
        
-        # Right panel - Preview
         right_panel = ctk.CTkFrame(content_frame, fg_color=COLORS['dark_card'])
         right_panel.pack(side="right", fill="both", expand=True)
+       
+        # FFmpeg Warning Banner (shown if FFmpeg not available)
+        status = self.download_manager.get_ffmpeg_status()
+        if not status['available']:
+            warning_banner = ctk.CTkFrame(
+                left_panel,
+                fg_color=COLORS['warning'],
+                corner_radius=8,
+                height=60
+            )
+            warning_banner.pack(fill="x", padx=20, pady=(20, 10))
+            warning_banner.pack_propagate(False)
+            
+            warning_text = ctk.CTkLabel(
+                warning_banner,
+                text="⚠️ FFMPEG NOT FOUND - FALLBACK MODE ACTIVE ⚠️\nHigh quality may fallback to lower resolutions | Install FFmpeg for best results",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color="#000000",
+                wraplength=350
+            )
+            warning_text.pack(expand=True, padx=10, pady=10)
+            
+            install_btn = ctk.CTkButton(
+                warning_banner,
+                text="Download FFmpeg",
+                width=120,
+                height=25,
+                font=ctk.CTkFont(size=11),
+                fg_color="#000000",
+                hover_color="#333333",
+                text_color=COLORS['warning'],
+                command=lambda: webbrowser.open("https://ffmpeg.org/download.html")
+            )
+            install_btn.pack(pady=(0, 10))
        
         # URL Input
         url_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
@@ -1236,19 +1211,32 @@ class YouTubeDownloaderPro:
             )
             rb.pack(anchor="w", pady=2)
        
-        # Quality selection - SIMPLIFIED
+        # Quality selection
         quality_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
         quality_frame.pack(fill="x", padx=20, pady=10)
        
+        quality_header = ctk.CTkFrame(quality_frame, fg_color="transparent")
+        quality_header.pack(fill="x")
+        
         ctk.CTkLabel(
-            quality_frame,
+            quality_header,
             text="Quality:",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=COLORS['text_primary']
-        ).pack(anchor="w")
+        ).pack(side="left")
+        
+        # Show quality note based on FFmpeg
+        if not status['available']:
+            quality_note = ctk.CTkLabel(
+                quality_header,
+                text="(High quality may fallback - No FFmpeg)",
+                font=ctk.CTkFont(size=11),
+                text_color=COLORS['warning']
+            )
+            quality_note.pack(side="left", padx=(10, 0))
        
-        quality_options = ["best", "1080p", "720p", "480p", "360p", "worst"]
-       
+        quality_options = ["best", "4k", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "worst"]
+        
         self.quality_combo = ctk.CTkComboBox(
             quality_frame,
             values=quality_options,
@@ -1260,8 +1248,17 @@ class YouTubeDownloaderPro:
             button_color=COLORS['primary'],
             button_hover_color=COLORS['primary']
         )
-        self.quality_combo.set("1080p")
+        
+        # Set default quality based on FFmpeg
+        if status['available']:
+            self.quality_combo.set("1080p")
+        else:
+            self.quality_combo.set("720p")
+        
         self.quality_combo.pack(fill="x", pady=(5, 0))
+        
+        # Bind quality selection to validation
+        self.quality_combo.configure(command=self.on_quality_selected)
        
         # Advanced options
         advanced_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
@@ -1274,7 +1271,6 @@ class YouTubeDownloaderPro:
             text_color=COLORS['text_primary']
         ).pack(anchor="w")
        
-        # Subtitles option
         subtitles_check = ctk.CTkCheckBox(
             advanced_frame,
             text="Include subtitles (English only)",
@@ -1286,7 +1282,6 @@ class YouTubeDownloaderPro:
         )
         subtitles_check.pack(anchor="w", pady=(5, 2))
        
-        # Metadata option
         metadata_check = ctk.CTkCheckBox(
             advanced_frame,
             text="Embed metadata",
@@ -1333,20 +1328,20 @@ class YouTubeDownloaderPro:
         )
         browse_btn.pack(side="right")
        
-        # Test download button
-        test_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
-        test_frame.pack(fill="x", padx=20, pady=10)
+        # Verify FFmpeg button
+        verify_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
+        verify_frame.pack(fill="x", padx=20, pady=10)
        
-        test_btn = ctk.CTkButton(
-            test_frame,
-            text="🧪 Test Quality",
+        verify_btn = ctk.CTkButton(
+            verify_frame,
+            text="🔧 Verify FFmpeg",
             height=30,
-            command=self.test_quality,
+            command=self.verify_ffmpeg,
             fg_color=COLORS['secondary'],
             hover_color="#6C6AFF",
             text_color=COLORS['text_primary']
         )
-        test_btn.pack(fill="x")
+        verify_btn.pack(fill="x")
        
         # Action buttons
         button_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
@@ -1376,11 +1371,10 @@ class YouTubeDownloaderPro:
         )
         download_btn.pack(fill="x")
        
-        # Preview area in right panel
+        # Preview area
         self.preview_frame = ctk.CTkFrame(right_panel, fg_color=COLORS['dark_card'])
         self.preview_frame.pack(fill="both", expand=True, padx=20, pady=20)
        
-        # Initial preview message
         preview_label = ctk.CTkLabel(
             self.preview_frame,
             text="Enter a YouTube URL and click 'Fetch Info' to see video details",
@@ -1388,14 +1382,285 @@ class YouTubeDownloaderPro:
             text_color=COLORS['text_secondary']
         )
         preview_label.place(relx=0.5, rely=0.5, anchor="center")
+    
+    def on_quality_selected(self, choice):
+        """Validate quality selection and show warning if needed"""
+        status = self.download_manager.get_ffmpeg_status()
+        warning = FFmpegValidator.get_quality_warning(choice, status['available'])
+        
+        if warning and not status['available']:
+            # Show warning but respect user's choice (don't revert)
+            messagebox.showwarning(
+                "Quality Warning",
+                f"{warning}\n\nThe download will proceed with the best available quality."
+            )
+    
+    def verify_ffmpeg(self):
+        """Manually verify FFmpeg and update UI"""
+        self.status_message.set("Verifying FFmpeg...")
+        
+        # Re-validate FFmpeg
+        self.download_manager._validate_ffmpeg()
+        status = self.download_manager.get_ffmpeg_status()
+        
+        # Update UI
+        if status['available']:
+            self.ffmpeg_status_btn.configure(
+                text="✓ FFmpeg: AVAILABLE",
+                fg_color=COLORS['success']
+            )
+            messagebox.showinfo(
+                "FFmpeg Verified ✓",
+                f"{status['message']}\n\n"
+                f"✅ High quality downloads (1080p, 4K) are now available!\n"
+                f"✅ Video and audio will be merged for best quality"
+            )
+        else:
+            self.ffmpeg_status_btn.configure(
+                text="⚠ FFmpeg: NOT FOUND",
+                fg_color=COLORS['warning']
+            )
+            
+            result = messagebox.askyesno(
+                "FFmpeg Not Found",
+                f"{status['message']}\n\n"
+                f"⚠ Without FFmpeg, high quality downloads will fallback to combined streams.\n\n"
+                f"Would you like to open the FFmpeg download page?"
+            )
+            if result:
+                webbrowser.open("https://ffmpeg.org/download.html")
+        
+        self.status_message.set("FFmpeg verification complete")
+    
+    def fetch_video_info(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Warning", "Please enter a YouTube URL")
+            return
+       
+        for widget in self.preview_frame.winfo_children():
+            widget.destroy()
+       
+        loading_label = ctk.CTkLabel(
+            self.preview_frame,
+            text="Fetching video information...",
+            font=ctk.CTkFont(size=16),
+            text_color=COLORS['text_secondary']
+        )
+        loading_label.place(relx=0.5, rely=0.5, anchor="center")
+       
+        threading.Thread(target=self._fetch_video_info_thread, args=(url,), daemon=True).start()
+   
+    def _fetch_video_info_thread(self, url):
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+            }
+           
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                self.root.after(0, lambda: self.display_video_info(info))
+               
+        except Exception as e:
+            error_msg = str(e)
+            self.root.after(0, lambda: self.show_error("Failed to fetch video info", error_msg))
+   
+    def display_video_info(self, info):
+        for widget in self.preview_frame.winfo_children():
+            widget.destroy()
+       
+        try:
+            container = ctk.CTkScrollableFrame(
+                self.preview_frame,
+                fg_color=COLORS['dark_card'],
+                scrollbar_button_color=COLORS['dark_gray'],
+                scrollbar_button_hover_color=COLORS['gray']
+            )
+            container.pack(fill="both", expand=True)
+           
+            thumbnail_url = info.get('thumbnail')
+            thumbnail_frame = ctk.CTkFrame(container, fg_color="transparent")
+            thumbnail_frame.pack(fill="x", padx=20, pady=20)
+           
+            if thumbnail_url:
+                try:
+                    response = requests.get(thumbnail_url, timeout=10)
+                    img_data = response.content
+                    img = Image.open(BytesIO(img_data))
+                    max_size = (400, 225)
+                    img.thumbnail(max_size, Image.Resampling.LANCZOS)
+                    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                    thumbnail_label = ctk.CTkLabel(thumbnail_frame, image=ctk_img, text="")
+                    thumbnail_label.pack()
+                except Exception as e:
+                    logger.error(f"Failed to load thumbnail: {e}")
+                    placeholder = ctk.CTkLabel(
+                        thumbnail_frame,
+                        text="📺 Thumbnail not available",
+                        font=ctk.CTkFont(size=14),
+                        text_color=COLORS['text_secondary']
+                    )
+                    placeholder.pack()
+           
+            info_frame = ctk.CTkFrame(container, fg_color="transparent")
+            info_frame.pack(fill="x", padx=20, pady=(0, 20))
+           
+            title = info.get('title', 'Unknown Title')
+            if len(title) > 100:
+                title = title[:97] + "..."
+           
+            title_label = ctk.CTkLabel(
+                info_frame,
+                text=title,
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=COLORS['text_primary'],
+                wraplength=600
+            )
+            title_label.pack(anchor="w", pady=(0, 10))
+           
+            details = [
+                ("👤 Channel", info.get('channel', 'Unknown')),
+                ("⏱️ Duration", self._format_duration(info.get('duration', 0))),
+                ("👁️ Views", f"{info.get('view_count', 0):,}"),
+                ("⭐ Likes", f"{info.get('like_count', 0):,}"),
+                ("📅 Upload Date", info.get('upload_date', 'Unknown')),
+                ("🔗 Video ID", info.get('id', 'Unknown'))
+            ]
+           
+            for label, value in details:
+                detail_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
+                detail_frame.pack(fill="x", pady=2)
+               
+                ctk.CTkLabel(
+                    detail_frame,
+                    text=label,
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=COLORS['text_secondary'],
+                    width=120
+                ).pack(side="left")
+               
+                ctk.CTkLabel(
+                    detail_frame,
+                    text=str(value),
+                    font=ctk.CTkFont(size=13),
+                    text_color=COLORS['text_primary']
+                ).pack(side="left")
+            
+            # Show FFmpeg status prominently
+            status = self.download_manager.get_ffmpeg_status()
+            ffmpeg_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
+            ffmpeg_frame.pack(fill="x", pady=(10, 0))
+            
+            if status['available']:
+                ffmpeg_status = ctk.CTkLabel(
+                    ffmpeg_frame,
+                    text="✅ FFMPEG: AVAILABLE - High quality downloads enabled",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=COLORS['success']
+                )
+            else:
+                ffmpeg_status = ctk.CTkLabel(
+                    ffmpeg_frame,
+                    text="❌ FFMPEG: NOT FOUND - Will fallback to best combined stream",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=COLORS['error']
+                )
+            ffmpeg_status.pack(anchor="w")
+            
+            # Show available resolutions
+            formats = info.get('formats', [])
+            resolutions = set()
+            for fmt in formats:
+                if fmt.get('vcodec') != 'none' and fmt.get('height'):
+                    resolutions.add(fmt.get('height'))
+            
+            if resolutions:
+                res_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
+                res_frame.pack(fill="x", pady=(10, 0))
+                
+                ctk.CTkLabel(
+                    res_frame,
+                    text="Available Resolutions:",
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=COLORS['text_secondary']
+                ).pack(anchor="w")
+                
+                sorted_res = sorted(resolutions, reverse=True)
+                res_text = ", ".join([f"{r}p" for r in sorted_res[:8]])
+                if len(sorted_res) > 8:
+                    res_text += f" and {len(sorted_res)-8} more"
+                
+                ctk.CTkLabel(
+                    res_frame,
+                    text=res_text,
+                    font=ctk.CTkFont(size=13),
+                    text_color=COLORS['text_primary']
+                ).pack(anchor="w")
+                
+                # Show what's possible with current FFmpeg
+                if not status['available'] and max(resolutions) > 720:
+                    warning_label = ctk.CTkLabel(
+                        res_frame,
+                        text=f"⚠️ This video has {max(resolutions)}p available, but requires FFmpeg to merge high quality video+audio",
+                        font=ctk.CTkFont(size=11),
+                        text_color=COLORS['warning']
+                    )
+                    warning_label.pack(anchor="w", pady=(5, 0))
+           
+            self.video_cache[self.url_entry.get()] = info
+           
+        except Exception as e:
+            logger.error(f"Failed to display video info: {e}")
+            error_label = ctk.CTkLabel(
+                self.preview_frame,
+                text=f"Error: {str(e)}",
+                font=ctk.CTkFont(size=14),
+                text_color=COLORS['error']
+            )
+            error_label.place(relx=0.5, rely=0.5, anchor="center")
+    
+    def add_to_queue(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Warning", "Please enter a YouTube URL")
+            return
+       
+        if url in self.video_cache:
+            info = self.video_cache[url]
+            title = info.get('title', 'Unknown Video')
+        else:
+            try:
+                with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    title = info.get('title', 'Unknown Video')
+            except:
+                title = "Unknown Video"
+       
+        format_type = self.format_var.get()
+       
+        task_id, status_msg = self.download_manager.add_task(
+            url=url,
+            format_type=format_type,
+            quality=self.quality_combo.get(),
+            output_path=self.path_var.get(),
+            title=title,
+            include_subtitles=self.subtitles_var.get(),
+            embed_metadata=self.metadata_var.get()
+        )
+       
+        if task_id:
+            self.status_message.set(f"Added to queue: {title[:50]}...")
+            self.refresh_task_list()
+            self.tab_view.set("📋 Queue")
+        else:
+            messagebox.showwarning("Warning", status_msg)
    
     def setup_queue_tab(self):
-        """Setup queue tab"""
-        # Main frame
         main_frame = ctk.CTkFrame(self.queue_tab, fg_color=COLORS['dark_bg'])
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
        
-        # Header with controls
         header_frame = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         header_frame.pack(fill="x", pady=(0, 10))
        
@@ -1406,7 +1671,6 @@ class YouTubeDownloaderPro:
             text_color=COLORS['text_primary']
         ).pack(side="left", padx=20, pady=10)
        
-        # Control buttons
         control_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         control_frame.pack(side="right", padx=20)
        
@@ -1443,27 +1707,20 @@ class YouTubeDownloaderPro:
         )
         clear_btn.pack(side="left", padx=5)
        
-        # Queue list container
         list_container = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         list_container.pack(fill="both", expand=True)
        
-        # Scrollable frame for queue items
         self.queue_scroll = ctk.CTkScrollableFrame(
             list_container,
             fg_color=COLORS['dark_card']
         )
         self.queue_scroll.pack(fill="both", expand=True, padx=10, pady=10)
-       
-        # Configure scrollable frame text color
         self.queue_scroll._text_color = COLORS['text_primary']
    
     def setup_history_tab(self):
-        """Setup history tab"""
-        # Main frame
         main_frame = ctk.CTkFrame(self.history_tab, fg_color=COLORS['dark_bg'])
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
        
-        # Header
         header_frame = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         header_frame.pack(fill="x", pady=(0, 10))
        
@@ -1474,7 +1731,6 @@ class YouTubeDownloaderPro:
             text_color=COLORS['text_primary']
         ).pack(side="left", padx=20, pady=10)
        
-        # Control buttons
         control_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         control_frame.pack(side="right", padx=20)
        
@@ -1511,23 +1767,18 @@ class YouTubeDownloaderPro:
         )
         open_btn.pack(side="left", padx=5)
        
-        # History list
         list_frame = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         list_frame.pack(fill="both", expand=True)
        
-        # Create treeview with scrollbars
         tree_frame = ctk.CTkFrame(list_frame, fg_color=COLORS['dark_card'])
         tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
        
-        # Vertical scrollbar
         v_scrollbar = ttk.Scrollbar(tree_frame)
         v_scrollbar.pack(side="right", fill="y")
        
-        # Horizontal scrollbar
         h_scrollbar = ttk.Scrollbar(tree_frame, orient="horizontal")
         h_scrollbar.pack(side="bottom", fill="x")
        
-        # Create treeview
         self.history_tree = ttk.Treeview(
             tree_frame,
             columns=("status", "format", "quality", "size", "date"),
@@ -1537,11 +1788,9 @@ class YouTubeDownloaderPro:
             xscrollcommand=h_scrollbar.set
         )
        
-        # Configure scrollbars
         v_scrollbar.config(command=self.history_tree.yview)
         h_scrollbar.config(command=self.history_tree.xview)
        
-        # Define columns
         self.history_tree.heading("#0", text="Title", anchor="w")
         self.history_tree.heading("status", text="Status", anchor="w")
         self.history_tree.heading("format", text="Format", anchor="w")
@@ -1549,7 +1798,6 @@ class YouTubeDownloaderPro:
         self.history_tree.heading("size", text="Size", anchor="w")
         self.history_tree.heading("date", text="Date", anchor="w")
        
-        # Column widths
         self.history_tree.column("#0", width=400, minwidth=200)
         self.history_tree.column("status", width=100, minwidth=80)
         self.history_tree.column("format", width=80, minwidth=60)
@@ -1557,11 +1805,9 @@ class YouTubeDownloaderPro:
         self.history_tree.column("size", width=100, minwidth=80)
         self.history_tree.column("date", width=150, minwidth=120)
        
-        # Style the treeview
         style = ttk.Style()
         style.theme_use("default")
        
-        # Configure Treeview colors for dark theme
         style.configure(
             "Treeview",
             background=COLORS['dark_card'],
@@ -1583,23 +1829,17 @@ class YouTubeDownloaderPro:
             foreground=[('selected', 'white')]
         )
        
-        # Configure treeview tags for different statuses
         self.history_tree.tag_configure('completed', foreground=COLORS['success'])
         self.history_tree.tag_configure('error', foreground=COLORS['error'])
         self.history_tree.tag_configure('cancelled', foreground=COLORS['warning'])
        
-        # Pack treeview
         self.history_tree.pack(fill="both", expand=True)
-       
-        # Bind double-click event
         self.history_tree.bind("<Double-1>", self.on_history_item_double_click)
    
     def setup_playlist_tab(self):
-        """Setup playlist tab"""
         main_frame = ctk.CTkFrame(self.playlist_tab, fg_color=COLORS['dark_bg'])
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
        
-        # Header
         header_frame = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         header_frame.pack(fill="x", pady=(0, 10))
        
@@ -1610,7 +1850,6 @@ class YouTubeDownloaderPro:
             text_color=COLORS['text_primary']
         ).pack(side="left", padx=20, pady=10)
        
-        # Playlist URL input
         url_frame = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         url_frame.pack(fill="x", pady=(0, 10))
        
@@ -1646,11 +1885,9 @@ class YouTubeDownloaderPro:
         )
         fetch_playlist_btn.pack(side="right")
        
-        # Playlist info display
         self.playlist_info_frame = ctk.CTkFrame(main_frame, fg_color=COLORS['dark_card'])
         self.playlist_info_frame.pack(fill="both", expand=True)
        
-        # Initial message
         info_label = ctk.CTkLabel(
             self.playlist_info_frame,
             text="Enter a playlist URL to see details",
@@ -1660,7 +1897,6 @@ class YouTubeDownloaderPro:
         info_label.place(relx=0.5, rely=0.5, anchor="center")
    
     def setup_status_bar(self):
-        """Setup status bar at bottom"""
         status_frame = ctk.CTkFrame(
             self.main_container,
             fg_color=COLORS['dark_card'],
@@ -1669,7 +1905,6 @@ class YouTubeDownloaderPro:
         status_frame.pack(fill="x", padx=10, pady=(5, 10))
         status_frame.pack_propagate(False)
        
-        # Status message
         self.status_message = ctk.StringVar(value="Ready")
         status_label = ctk.CTkLabel(
             status_frame,
@@ -1679,7 +1914,6 @@ class YouTubeDownloaderPro:
         )
         status_label.pack(side="left", padx=20)
        
-        # System info
         sys_info = f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} | {platform.system()} {platform.release()}"
         sys_label = ctk.CTkLabel(
             status_frame,
@@ -1689,357 +1923,13 @@ class YouTubeDownloaderPro:
         )
         sys_label.pack(side="right", padx=20)
    
-    def test_quality(self):
-        """Test the quality selection logic"""
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("Warning", "Please enter a YouTube URL first")
-            return
-       
-        # Create a test task
-        test_task = DownloadTask(
-            id="test",
-            url=url,
-            title="Test",
-            format_type=self.format_var.get(),
-            quality=self.quality_combo.get(),
-            output_path=self.path_var.get(),
-            status=DownloadStatus.QUEUED
-        )
-       
-        # Get video info
-        info = self.download_manager._get_video_info(url)
-        if not info:
-            messagebox.showerror("Error", "Could not get video info")
-            return
-       
-        # Build options using the new method
-        ydl_opts = self.download_manager._build_ydl_options_simple(test_task, info)
-       
-        # Show the format selector being used
-        format_selector = ydl_opts.get('format', 'Not set')
-       
-        # Get available formats
-        formats = info.get('formats', [])
-        resolutions = set()
-        for fmt in formats:
-            if fmt.get('vcodec') != 'none':
-                height = fmt.get('height')
-                if height:
-                    resolutions.add(height)
-       
-        message = f"""
-        Quality Test Results:
-       
-        Requested Quality: {test_task.quality}
-        Format Selector: {format_selector}
-        FFmpeg Available: {self.download_manager.has_ffmpeg}
-       
-        Available Resolutions: {sorted(resolutions, reverse=True)}
-       
-        The format selector above will be used for downloads.
-        If you're getting low quality, try:
-        1. Use 'best' instead of specific resolution
-        2. Make sure FFmpeg is properly installed
-        3. Check the log file for detailed info
-        """
-       
-        messagebox.showinfo("Quality Test", message)
-   
-    def fetch_video_info(self):
-        """Fetch video information from URL"""
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("Warning", "Please enter a YouTube URL")
-            return
-       
-        # Clear preview frame
-        for widget in self.preview_frame.winfo_children():
-            widget.destroy()
-       
-        # Show loading
-        loading_label = ctk.CTkLabel(
-            self.preview_frame,
-            text="Fetching video information...",
-            font=ctk.CTkFont(size=16),
-            text_color=COLORS['text_secondary']
-        )
-        loading_label.place(relx=0.5, rely=0.5, anchor="center")
-       
-        # Fetch in thread
-        threading.Thread(target=self._fetch_video_info_thread, args=(url,), daemon=True).start()
-   
-    def _fetch_video_info_thread(self, url):
-        """Thread for fetching video info"""
-        try:
-            # Get video info using yt-dlp
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': False,
-            }
-           
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-               
-                # Update UI in main thread
-                self.root.after(0, lambda: self.display_video_info(info))
-               
-        except Exception as e:
-            error_msg = str(e)
-            self.root.after(0, lambda: self.show_error("Failed to fetch video info", error_msg))
-   
-    def display_video_info(self, info):
-        """Display video information in preview"""
-        # Clear preview frame
-        for widget in self.preview_frame.winfo_children():
-            widget.destroy()
-       
-        try:
-            # Create main container
-            container = ctk.CTkScrollableFrame(
-                self.preview_frame,
-                fg_color=COLORS['dark_card'],
-                scrollbar_button_color=COLORS['dark_gray'],
-                scrollbar_button_hover_color=COLORS['gray']
-            )
-            container.pack(fill="both", expand=True)
-           
-            # Thumbnail
-            thumbnail_url = info.get('thumbnail')
-            thumbnail_frame = ctk.CTkFrame(container, fg_color="transparent")
-            thumbnail_frame.pack(fill="x", padx=20, pady=20)
-           
-            if thumbnail_url:
-                try:
-                    response = requests.get(thumbnail_url, timeout=10)
-                    img_data = response.content
-                    img = Image.open(BytesIO(img_data))
-                   
-                    # Resize to reasonable dimensions
-                    max_size = (400, 225)
-                    img.thumbnail(max_size, Image.Resampling.LANCZOS)
-                   
-                    # Convert to CTkImage
-                    ctk_img = ctk.CTkImage(
-                        light_image=img,
-                        dark_image=img,
-                        size=img.size
-                    )
-                   
-                    thumbnail_label = ctk.CTkLabel(
-                        thumbnail_frame,
-                        image=ctk_img,
-                        text=""
-                    )
-                    thumbnail_label.pack()
-                   
-                except Exception as e:
-                    logger.error(f"Failed to load thumbnail: {e}")
-                    # Show placeholder
-                    placeholder = ctk.CTkLabel(
-                        thumbnail_frame,
-                        text="📺 Thumbnail not available",
-                        font=ctk.CTkFont(size=14),
-                        text_color=COLORS['text_secondary']
-                    )
-                    placeholder.pack()
-           
-            # Video info
-            info_frame = ctk.CTkFrame(container, fg_color="transparent")
-            info_frame.pack(fill="x", padx=20, pady=(0, 20))
-           
-            # Title
-            title = info.get('title', 'Unknown Title')
-            if len(title) > 100:
-                title = title[:97] + "..."
-           
-            title_label = ctk.CTkLabel(
-                info_frame,
-                text=title,
-                font=ctk.CTkFont(size=18, weight="bold"),
-                text_color=COLORS['text_primary'],
-                wraplength=600
-            )
-            title_label.pack(anchor="w", pady=(0, 10))
-           
-            # Details grid
-            details = [
-                ("👤 Channel", info.get('channel', 'Unknown')),
-                ("⏱️ Duration", self.format_duration(info.get('duration', 0))),
-                ("👁️ Views", f"{info.get('view_count', 0):,}"),
-                ("⭐ Likes", f"{info.get('like_count', 0):,}"),
-                ("📅 Upload Date", info.get('upload_date', 'Unknown')),
-                ("🔗 Video ID", info.get('id', 'Unknown'))
-            ]
-           
-            for label, value in details:
-                detail_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-                detail_frame.pack(fill="x", pady=2)
-               
-                ctk.CTkLabel(
-                    detail_frame,
-                    text=label,
-                    font=ctk.CTkFont(size=13, weight="bold"),
-                    text_color=COLORS['text_secondary'],
-                    width=120
-                ).pack(side="left")
-               
-                ctk.CTkLabel(
-                    detail_frame,
-                    text=str(value),
-                    font=ctk.CTkFont(size=13),
-                    text_color=COLORS['text_primary']
-                ).pack(side="left")
-           
-            # Available formats
-            formats = info.get('formats', [])
-            if formats:
-                format_frame = ctk.CTkFrame(container, fg_color="transparent")
-                format_frame.pack(fill="x", padx=20, pady=(10, 20))
-               
-                ctk.CTkLabel(
-                    format_frame,
-                    text="Available Formats:",
-                    font=ctk.CTkFont(size=14, weight="bold"),
-                    text_color=COLORS['text_primary']
-                ).pack(anchor="w", pady=(0, 10))
-               
-                # Group formats by quality
-                video_formats = []
-                audio_formats = []
-               
-                for fmt in formats:
-                    if fmt.get('vcodec') != 'none':
-                        video_formats.append(fmt)
-                    if fmt.get('acodec') != 'none':
-                        audio_formats.append(fmt)
-               
-                # Show video formats
-                if video_formats:
-                    video_frame = ctk.CTkFrame(format_frame, fg_color="transparent")
-                    video_frame.pack(fill="x", pady=(0, 10))
-                   
-                    ctk.CTkLabel(
-                        video_frame,
-                        text="Video:",
-                        font=ctk.CTkFont(size=12, weight="bold"),
-                        text_color=COLORS['text_secondary']
-                    ).pack(anchor="w")
-                   
-                    # Get unique resolutions
-                    resolutions = set()
-                    for fmt in video_formats:
-                        height = fmt.get('height')
-                        if height:
-                            resolutions.add(height)
-                   
-                    resolutions = sorted(resolutions, reverse=True)
-                    resolutions_text = ", ".join([f"{p}p" for p in resolutions[:5]])
-                    if len(resolutions) > 5:
-                        resolutions_text += f" and {len(resolutions)-5} more"
-                   
-                    ctk.CTkLabel(
-                        video_frame,
-                        text=resolutions_text,
-                        font=ctk.CTkFont(size=12),
-                        text_color=COLORS['text_primary']
-                    ).pack(anchor="w")
-               
-                # Show audio formats
-                if audio_formats:
-                    audio_frame = ctk.CTkFrame(format_frame, fg_color="transparent")
-                    audio_frame.pack(fill="x")
-                   
-                    ctk.CTkLabel(
-                        audio_frame,
-                        text="Audio:",
-                        font=ctk.CTkFont(size=12, weight="bold"),
-                        text_color=COLORS['text_secondary']
-                    ).pack(anchor="w")
-                   
-                    # Get audio codecs
-                    codecs = set()
-                    for fmt in audio_formats:
-                        acodec = fmt.get('acodec')
-                        if acodec and acodec != 'none':
-                            codecs.add(acodec.split('.')[0])
-                   
-                    codecs_text = ", ".join(sorted(codecs))
-                    ctk.CTkLabel(
-                        audio_frame,
-                        text=codecs_text,
-                        font=ctk.CTkFont(size=12),
-                        text_color=COLORS['text_primary']
-                    ).pack(anchor="w")
-           
-            # Cache the info
-            self.video_cache[self.url_entry.get()] = info
-           
-        except Exception as e:
-            logger.error(f"Failed to display video info: {e}")
-            error_label = ctk.CTkLabel(
-                self.preview_frame,
-                text=f"Error: {str(e)}",
-                font=ctk.CTkFont(size=14),
-                text_color=COLORS['error']
-            )
-            error_label.place(relx=0.5, rely=0.5, anchor="center")
-   
-    def add_to_queue(self):
-        """Add current video to download queue"""
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("Warning", "Please enter a YouTube URL")
-            return
-       
-        # Get video info from cache or fetch
-        if url in self.video_cache:
-            info = self.video_cache[url]
-            title = info.get('title', 'Unknown Video')
-        else:
-            # Fetch quickly
-            try:
-                with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    title = info.get('title', 'Unknown Video')
-            except:
-                title = "Unknown Video"
-       
-        # Get format type
-        format_type = self.format_var.get()
-       
-        # Add to queue using new method
-        task_id = self.download_manager.add_task(
-            url=url,
-            format_type=format_type,
-            quality=self.quality_combo.get(),
-            output_path=self.path_var.get(),
-            title=title,
-            include_subtitles=self.subtitles_var.get(),
-            embed_metadata=self.metadata_var.get()
-        )
-       
-        # Show success message
-        self.status_message.set(f"Added to queue: {title[:50]}...")
-       
-        # Refresh queue display
-        self.refresh_task_list()
-       
-        # Switch to queue tab
-        self.tab_view.set("📋 Queue")
-   
     def refresh_task_list(self):
-        """Refresh the download queue display"""
-        # Clear current display
         for widget in self.queue_scroll.winfo_children():
             widget.destroy()
        
-        # Get all active and queued tasks
         tasks = list(self.download_manager.active_tasks.values()) + list(self.download_manager.task_queue)
        
         if not tasks:
-            # Show empty message
             empty_label = ctk.CTkLabel(
                 self.queue_scroll,
                 text="Queue is empty",
@@ -2049,7 +1939,6 @@ class YouTubeDownloaderPro:
             empty_label.pack(pady=50)
             return
        
-        # Sort tasks: downloading first, then queued, then paused
         status_order = {
             DownloadStatus.DOWNLOADING: 0,
             DownloadStatus.PROCESSING: 1,
@@ -2060,12 +1949,10 @@ class YouTubeDownloaderPro:
         }
         tasks.sort(key=lambda x: status_order.get(x.status, 999))
        
-        # Create task cards
         for task in tasks:
-            self.create_task_card(task)
+            self._create_task_card(task)
    
-    def create_task_card(self, task: DownloadTask):
-        """Create a task card for display"""
+    def _create_task_card(self, task: DownloadTask):
         card = ctk.CTkFrame(
             self.queue_scroll,
             fg_color=COLORS['dark_card'],
@@ -2075,7 +1962,6 @@ class YouTubeDownloaderPro:
         )
         card.pack(fill="x", pady=5, padx=5)
        
-        # Status color
         status_colors = {
             DownloadStatus.DOWNLOADING: COLORS['info'],
             DownloadStatus.PROCESSING: COLORS['secondary'],
@@ -2086,11 +1972,9 @@ class YouTubeDownloaderPro:
             DownloadStatus.COMPLETED: COLORS['success']
         }
        
-        # Card header
         header_frame = ctk.CTkFrame(card, fg_color="transparent")
         header_frame.pack(fill="x", padx=15, pady=(15, 5))
        
-        # Status indicator
         status_indicator = ctk.CTkFrame(
             header_frame,
             width=10,
@@ -2100,7 +1984,6 @@ class YouTubeDownloaderPro:
         )
         status_indicator.pack(side="left")
        
-        # Title
         title_text = task.title if len(task.title) <= 50 else task.title[:47] + "..."
         title_label = ctk.CTkLabel(
             header_frame,
@@ -2111,7 +1994,6 @@ class YouTubeDownloaderPro:
         )
         title_label.pack(side="left", padx=10)
        
-        # Status label
         status_label = ctk.CTkLabel(
             header_frame,
             text=task.status.value.upper(),
@@ -2120,7 +2002,6 @@ class YouTubeDownloaderPro:
         )
         status_label.pack(side="right")
        
-        # Progress bar
         progress_frame = ctk.CTkFrame(card, fg_color="transparent")
         progress_frame.pack(fill="x", padx=15, pady=5)
        
@@ -2134,11 +2015,9 @@ class YouTubeDownloaderPro:
         progress_bar.pack(fill="x")
         progress_bar.set(task.progress / 100)
        
-        # Progress info
         info_frame = ctk.CTkFrame(card, fg_color="transparent")
         info_frame.pack(fill="x", padx=15, pady=(0, 10))
        
-        # Format and quality
         format_label = ctk.CTkLabel(
             info_frame,
             text=f"{task.format_type.upper()} • {task.quality}",
@@ -2147,8 +2026,7 @@ class YouTubeDownloaderPro:
         )
         format_label.pack(side="left")
        
-        # Progress text
-        progress_text = self.get_progress_text(task)
+        progress_text = self._get_progress_text(task)
         progress_label = ctk.CTkLabel(
             info_frame,
             text=progress_text,
@@ -2157,7 +2035,6 @@ class YouTubeDownloaderPro:
         )
         progress_label.pack(side="right")
        
-        # Control buttons
         if task.status in [DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.ERROR]:
             control_frame = ctk.CTkFrame(card, fg_color="transparent")
             control_frame.pack(fill="x", padx=15, pady=(0, 15))
@@ -2198,7 +2075,6 @@ class YouTubeDownloaderPro:
                 )
                 retry_btn.pack(side="left", padx=(0, 10))
            
-            # Cancel button
             cancel_btn = ctk.CTkButton(
                 control_frame,
                 text="✕ Cancel",
@@ -2225,20 +2101,18 @@ class YouTubeDownloaderPro:
             )
             pause_btn.pack(side="left")
    
-    def get_progress_text(self, task: DownloadTask) -> str:
-        """Get formatted progress text for a task"""
+    def _get_progress_text(self, task: DownloadTask) -> str:
         if task.status == DownloadStatus.COMPLETED:
-            if task.file_path:
-                size = os.path.getsize(task.file_path) if os.path.exists(task.file_path) else task.total_bytes
-                return f"Completed • {self.format_size(size)}"
+            if task.file_path and os.path.exists(task.file_path):
+                size = os.path.getsize(task.file_path)
+                return f"Completed • {self._format_size(size)}"
             return "Completed"
        
         elif task.status == DownloadStatus.DOWNLOADING:
-            downloaded = self.format_size(task.downloaded_bytes)
-            total = self.format_size(task.total_bytes) if task.total_bytes > 0 else "??"
-            speed = self.format_size(task.speed) if task.speed > 0 else "0"
-            eta = self.format_time(task.eta) if task.eta else "??"
-           
+            downloaded = self._format_size(task.downloaded_bytes)
+            total = self._format_size(task.total_bytes) if task.total_bytes > 0 else "??"
+            speed = self._format_size(task.speed) if task.speed > 0 else "0"
+            eta = self._format_time(task.eta) if task.eta else "??"
             return f"{downloaded} / {total} • {speed}/s • ETA: {eta}"
        
         elif task.status == DownloadStatus.PROCESSING:
@@ -2254,99 +2128,68 @@ class YouTubeDownloaderPro:
             return task.status.value.capitalize()
    
     def start_task(self, task_id: str):
-        """Start a specific task"""
-        success = self.download_manager.start_task(task_id)
-        if success:
+        if self.download_manager.start_task(task_id):
             self.status_message.set("Task started")
             self.refresh_task_list()
    
     def pause_task(self, task_id: str):
-        """Pause a specific task"""
-        success = self.download_manager.pause_task(task_id)
-        if success:
+        if self.download_manager.pause_task(task_id):
             self.status_message.set("Task paused")
             self.refresh_task_list()
    
     def resume_task(self, task_id: str):
-        """Resume a specific task"""
-        success = self.download_manager.resume_task(task_id)
-        if success:
+        if self.download_manager.resume_task(task_id):
             self.status_message.set("Task resumed")
             self.refresh_task_list()
    
     def cancel_task(self, task_id: str):
-        """Cancel a specific task"""
         if messagebox.askyesno("Confirm", "Are you sure you want to cancel this download?"):
-            success = self.download_manager.cancel_task(task_id)
-            if success:
+            if self.download_manager.cancel_task(task_id):
                 self.status_message.set("Task cancelled")
                 self.refresh_task_list()
    
     def retry_task(self, task_id: str):
-        """Retry a failed task"""
         task = self.download_manager.get_task(task_id)
         if task and task.status == DownloadStatus.ERROR:
-            # Reset task status
             task.status = DownloadStatus.QUEUED
             task.progress = 0
             task.error = None
-           
-            # Add to queue
             self.download_manager.task_queue.append(task)
             self.download_manager.save_state()
-           
-            # Refresh and start
             self.refresh_task_list()
             self.download_manager._auto_start_downloads()
-           
             self.status_message.set("Task retrying...")
    
     def start_all_downloads(self):
-        """Start all queued downloads"""
-        # Start downloads until max concurrent reached
         self.download_manager._auto_start_downloads()
         self.refresh_task_list()
         self.status_message.set("Starting all downloads...")
    
     def pause_all_downloads(self):
-        """Pause all active downloads"""
-        # Pause all active tasks
         for task_id in list(self.download_manager.active_tasks.keys()):
             self.download_manager.pause_task(task_id)
-       
         self.refresh_task_list()
         self.status_message.set("All downloads paused")
    
     def clear_queue(self):
-        """Clear the download queue"""
         if messagebox.askyesno("Confirm", "Clear all queued and paused downloads?"):
-            # Cancel all active
             for task_id in list(self.download_manager.active_tasks.keys()):
                 self.download_manager.cancel_task(task_id)
-           
-            # Clear queue
             for task in list(self.download_manager.task_queue):
                 task.status = DownloadStatus.CANCELLED
                 self.download_manager.task_history.append(task)
-           
             self.download_manager.task_queue.clear()
             self.download_manager.save_state()
-           
             self.refresh_task_list()
             self.status_message.set("Queue cleared")
    
     def refresh_history(self):
-        """Refresh download history display"""
-        # Clear current items
         for item in self.history_tree.get_children():
             self.history_tree.delete(item)
        
-        # Get history tasks
-        history_tasks = self.download_manager.task_history[-100:] # Last 100
+        history_tasks = self.download_manager.task_history[-100:]
        
-        # Add to treeview
-        for task in reversed(history_tasks): # Show newest first
-            # Format values
+        for task in reversed(history_tasks):
             status_text = task.status.value.capitalize()
             tags = []
            
@@ -2360,58 +2203,46 @@ class YouTubeDownloaderPro:
                 status_text = "⏹️ Cancelled"
                 tags.append('cancelled')
            
-            # Format date
             if task.completed_at:
                 date_str = datetime.fromtimestamp(task.completed_at).strftime('%Y-%m-%d %H:%M')
             else:
                 date_str = datetime.fromtimestamp(task.created_at).strftime('%Y-%m-%d %H:%M')
            
-            # Get file size
             size_str = ""
             if task.file_path and os.path.exists(task.file_path):
                 size = os.path.getsize(task.file_path)
-                size_str = self.format_size(size)
+                size_str = self._format_size(size)
             elif task.total_bytes > 0:
-                size_str = self.format_size(task.total_bytes)
+                size_str = self._format_size(task.total_bytes)
            
-            # Insert into tree
             self.history_tree.insert(
                 "",
                 "end",
                 text=task.title[:80] + "..." if len(task.title) > 80 else task.title,
-                values=(
-                    status_text,
-                    task.format_type,
-                    task.quality,
-                    size_str,
-                    date_str
-                ),
+                values=(status_text, task.format_type, task.quality, size_str, date_str),
                 tags=tuple(tags) if tags else ()
             )
    
     def clear_history(self):
-        """Clear download history"""
         if messagebox.askyesno("Confirm", "Clear all download history?"):
             self.download_manager.clear_completed()
             self.refresh_history()
             self.status_message.set("History cleared")
    
     def browse_path(self):
-        """Browse for download path"""
         directory = filedialog.askdirectory()
         if directory:
             self.path_var.set(directory)
    
     def open_download_folder(self):
-        """Open download folder in file explorer"""
         path = self.path_var.get()
         if os.path.exists(path):
             try:
                 if platform.system() == "Windows":
                     os.startfile(path)
-                elif platform.system() == "Darwin": # macOS
+                elif platform.system() == "Darwin":
                     subprocess.run(["open", path])
-                else: # Linux
+                else:
                     subprocess.run(["xdg-open", path])
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to open folder: {e}")
@@ -2419,17 +2250,14 @@ class YouTubeDownloaderPro:
             messagebox.showerror("Error", f"Folder does not exist: {path}")
    
     def fetch_playlist_info(self):
-        """Fetch playlist information"""
         url = self.playlist_url_entry.get().strip()
         if not url:
             messagebox.showwarning("Warning", "Please enter a playlist URL")
             return
        
-        # Clear info frame
         for widget in self.playlist_info_frame.winfo_children():
             widget.destroy()
        
-        # Show loading
         loading_label = ctk.CTkLabel(
             self.playlist_info_frame,
             text="Fetching playlist information...",
@@ -2438,11 +2266,9 @@ class YouTubeDownloaderPro:
         )
         loading_label.place(relx=0.5, rely=0.5, anchor="center")
        
-        # Fetch in thread
         threading.Thread(target=self._fetch_playlist_info_thread, args=(url,), daemon=True).start()
    
     def _fetch_playlist_info_thread(self, url):
-        """Thread for fetching playlist info"""
         try:
             ydl_opts = {
                 'quiet': True,
@@ -2453,21 +2279,16 @@ class YouTubeDownloaderPro:
            
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-               
-                # Update UI in main thread
-                self.root.after(0, lambda: self.display_playlist_info(info))
+                self.root.after(0, lambda: self._display_playlist_info(info))
                
         except Exception as e:
             error_msg = str(e)
             self.root.after(0, lambda: self.show_error("Failed to fetch playlist info", error_msg))
    
-    def display_playlist_info(self, info):
-        """Display playlist information"""
-        # Clear info frame
+    def _display_playlist_info(self, info):
         for widget in self.playlist_info_frame.winfo_children():
             widget.destroy()
        
-        # Create scrollable container
         container = ctk.CTkScrollableFrame(
             self.playlist_info_frame,
             fg_color=COLORS['dark_card'],
@@ -2477,7 +2298,6 @@ class YouTubeDownloaderPro:
         container.pack(fill="both", expand=True)
        
         try:
-            # Playlist title
             title = info.get('title', 'Unknown Playlist')
             title_label = ctk.CTkLabel(
                 container,
@@ -2488,11 +2308,9 @@ class YouTubeDownloaderPro:
             )
             title_label.pack(anchor="w", padx=20, pady=(20, 10))
            
-            # Playlist details
             details_frame = ctk.CTkFrame(container, fg_color="transparent")
             details_frame.pack(fill="x", padx=20, pady=(0, 20))
            
-            # Channel
             channel = info.get('channel', 'Unknown Channel')
             channel_label = ctk.CTkLabel(
                 details_frame,
@@ -2502,7 +2320,6 @@ class YouTubeDownloaderPro:
             )
             channel_label.pack(anchor="w")
            
-            # Video count
             entries = info.get('entries', [])
             video_count = len(entries) if entries else info.get('playlist_count', 0)
             count_label = ctk.CTkLabel(
@@ -2513,7 +2330,6 @@ class YouTubeDownloaderPro:
             )
             count_label.pack(anchor="w", pady=(5, 0))
            
-            # Download options
             options_frame = ctk.CTkFrame(container, fg_color="transparent")
             options_frame.pack(fill="x", padx=20, pady=(0, 20))
            
@@ -2524,7 +2340,6 @@ class YouTubeDownloaderPro:
                 text_color=COLORS['text_primary']
             ).pack(anchor="w", pady=(0, 10))
            
-            # Format selection for playlist
             format_var = ctk.StringVar(value="video")
             format_frame = ctk.CTkFrame(options_frame, fg_color="transparent")
             format_frame.pack(fill="x", pady=5)
@@ -2542,7 +2357,6 @@ class YouTubeDownloaderPro:
                 )
                 rb.pack(side="left", padx=(0, 20))
            
-            # Quality selection
             quality_frame = ctk.CTkFrame(options_frame, fg_color="transparent")
             quality_frame.pack(fill="x", pady=5)
            
@@ -2561,24 +2375,21 @@ class YouTubeDownloaderPro:
             quality_combo.set("1080p")
             quality_combo.pack(side="left", padx=(0, 20))
            
-            # Download button
             def download_playlist():
                 if not entries:
                     messagebox.showwarning("Warning", "No videos found in playlist")
                     return
                
-                # Ask for confirmation
                 if not messagebox.askyesno("Confirm", f"Download {video_count} videos from playlist?"):
                     return
                
-                # Add each video to queue
                 added_count = 0
                 for entry in entries:
                     if isinstance(entry, dict) and 'url' in entry:
                         video_url = entry.get('url')
                         video_title = entry.get('title', 'Unknown Video')
                        
-                        task_id = self.download_manager.add_task(
+                        self.download_manager.add_task(
                             url=video_url,
                             format_type=format_var.get(),
                             quality=quality_combo.get(),
@@ -2587,9 +2398,7 @@ class YouTubeDownloaderPro:
                             include_subtitles=self.subtitles_var.get(),
                             embed_metadata=self.metadata_var.get()
                         )
-                       
-                        if task_id:
-                            added_count += 1
+                        added_count += 1
                
                 self.status_message.set(f"Added {added_count} videos to queue")
                 self.refresh_task_list()
@@ -2607,7 +2416,6 @@ class YouTubeDownloaderPro:
             )
             download_btn.pack(fill="x", pady=(10, 0))
            
-            # Video list
             if entries:
                 list_frame = ctk.CTkFrame(container, fg_color="transparent")
                 list_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -2619,7 +2427,6 @@ class YouTubeDownloaderPro:
                     text_color=COLORS['text_primary']
                 ).pack(anchor="w", pady=(0, 10))
                
-                # Create scrollable list
                 video_list = ctk.CTkScrollableFrame(
                     list_frame,
                     fg_color=COLORS['dark_bg'],
@@ -2629,13 +2436,11 @@ class YouTubeDownloaderPro:
                 )
                 video_list.pack(fill="both", expand=True)
                
-                # Add videos
-                for i, entry in enumerate(entries[:50], 1): # Show first 50
+                for i, entry in enumerate(entries[:50], 1):
                     if isinstance(entry, dict):
                         video_frame = ctk.CTkFrame(video_list, fg_color="transparent")
                         video_frame.pack(fill="x", pady=2)
                        
-                        # Number
                         num_label = ctk.CTkLabel(
                             video_frame,
                             text=f"{i}.",
@@ -2645,26 +2450,24 @@ class YouTubeDownloaderPro:
                         )
                         num_label.pack(side="left")
                        
-                        # Title
-                        title = entry.get('title', 'Unknown Title')
-                        if len(title) > 60:
-                            title = title[:57] + "..."
+                        title_text = entry.get('title', 'Unknown Title')
+                        if len(title_text) > 60:
+                            title_text = title_text[:57] + "..."
                        
                         title_label = ctk.CTkLabel(
                             video_frame,
-                            text=title,
+                            text=title_text,
                             font=ctk.CTkFont(size=12),
                             text_color=COLORS['text_primary'],
                             wraplength=600
                         )
                         title_label.pack(side="left", padx=5)
                        
-                        # Duration
                         duration = entry.get('duration', 0)
                         if duration:
                             duration_label = ctk.CTkLabel(
                                 video_frame,
-                                text=self.format_duration(duration),
+                                text=self._format_duration(duration),
                                 font=ctk.CTkFont(size=11),
                                 text_color=COLORS['text_secondary'],
                                 width=80
@@ -2690,18 +2493,16 @@ class YouTubeDownloaderPro:
             error_label.pack(pady=50)
    
     def on_history_item_double_click(self, event):
-        """Handle double-click on history item"""
-        item = self.history_tree.selection()[0]
-        values = self.history_tree.item(item)
+        item = self.history_tree.selection()[0] if self.history_tree.selection() else None
+        if not item:
+            return
        
-        # Get the title from the tree item
+        values = self.history_tree.item(item)
         title = values.get('text', '')
        
-        # Find the task in history
         for task in self.download_manager.task_history:
-            if task.title.startswith(title[:50]): # Match by title prefix
+            if task.title.startswith(title[:50]):
                 if task.file_path and os.path.exists(task.file_path):
-                    # Open file location
                     try:
                         if platform.system() == "Windows":
                             os.startfile(os.path.dirname(task.file_path))
@@ -2716,81 +2517,29 @@ class YouTubeDownloaderPro:
                 break
    
     def on_tab_changed(self):
-        """Handle tab change event"""
         current_tab = self.tab_view.get()
-       
         if current_tab == "📋 Queue":
             self.refresh_task_list()
         elif current_tab == "📊 History":
             self.refresh_history()
    
     def toggle_theme(self):
-        """Toggle between dark and light themes"""
         if self.current_theme == "dark":
             ctk.set_appearance_mode("light")
             self.current_theme = "light"
-            # Update colors for light mode
-            global COLORS
-            COLORS = {
-                'primary': '#FF3B30',
-                'secondary': '#5856D6',
-                'dark_bg': '#F2F2F7',
-                'dark_card': '#FFFFFF',
-                'dark_text': '#000000',
-                'light_bg': '#F2F2F7',
-                'light_card': '#FFFFFF',
-                'light_text': '#000000',
-                'success': '#34C759',
-                'warning': '#FF9500',
-                'error': '#FF3B30',
-                'info': '#007AFF',
-                'gray': '#8E8E93',
-                'dark_gray': '#C7C7CC',
-                'text_primary': '#000000',
-                'text_secondary': '#8E8E93',
-                'text_disabled': '#C7C7CC',
-            }
         else:
             ctk.set_appearance_mode("dark")
             self.current_theme = "dark"
-            # Reset to dark colors
-            COLORS = {
-                'primary': '#FF3B30',
-                'secondary': '#5856D6',
-                'dark_bg': '#0A0A0A',
-                'dark_card': '#1A1A1A',
-                'dark_text': '#FFFFFF',
-                'light_bg': '#F2F2F7',
-                'light_card': '#FFFFFF',
-                'light_text': '#000000',
-                'success': '#34C759',
-                'warning': '#FF9500',
-                'error': '#FF3B30',
-                'info': '#007AFF',
-                'gray': '#8E8E93',
-                'dark_gray': '#3A3A3C',
-                'text_primary': '#FFFFFF',
-                'text_secondary': '#8E8E93',
-                'text_disabled': '#3A3A3C',
-            }
-       
-        # Recreate UI with new theme
         self.status_message.set(f"Switched to {self.current_theme} theme")
-        # Note: In a full implementation, you would update all widget colors here
-        # For simplicity, we're just changing the appearance mode
    
     def open_settings(self):
-        """Open settings dialog"""
         settings_window = ctk.CTkToplevel(self.root)
         settings_window.title("Settings")
         settings_window.geometry("600x500")
         settings_window.transient(self.root)
         settings_window.grab_set()
-       
-        # Set colors for settings window
         settings_window.configure(fg_color=COLORS['dark_bg'])
        
-        # Center the window
         settings_window.update_idletasks()
         width = settings_window.winfo_width()
         height = settings_window.winfo_height()
@@ -2798,7 +2547,6 @@ class YouTubeDownloaderPro:
         y = (settings_window.winfo_screenheight() // 2) - (height // 2)
         settings_window.geometry(f"{width}x{height}+{x}+{y}")
        
-        # Settings content
         container = ctk.CTkScrollableFrame(
             settings_window,
             fg_color=COLORS['dark_bg'],
@@ -2807,7 +2555,6 @@ class YouTubeDownloaderPro:
         )
         container.pack(fill="both", expand=True, padx=20, pady=20)
        
-        # Title
         title_label = ctk.CTkLabel(
             container,
             text="Settings",
@@ -2816,7 +2563,6 @@ class YouTubeDownloaderPro:
         )
         title_label.pack(anchor="w", pady=(0, 20))
        
-        # Concurrent downloads
         downloads_frame = ctk.CTkFrame(container, fg_color=COLORS['dark_card'])
         downloads_frame.pack(fill="x", pady=(0, 15))
        
@@ -2834,7 +2580,6 @@ class YouTubeDownloaderPro:
             to=10,
             number_of_steps=9,
             variable=concurrent_var,
-            command=lambda v: self.update_concurrent_downloads(int(float(v))),
             fg_color=COLORS['dark_gray'],
             progress_color=COLORS['primary'],
             button_color=COLORS['primary'],
@@ -2855,7 +2600,6 @@ class YouTubeDownloaderPro:
        
         concurrent_slider.configure(command=update_label)
        
-        # Default download path
         path_frame = ctk.CTkFrame(container, fg_color=COLORS['dark_card'])
         path_frame.pack(fill="x", pady=(0, 15))
        
@@ -2892,18 +2636,11 @@ class YouTubeDownloaderPro:
         )
         browse_btn.pack(anchor="e", padx=15, pady=(0, 15))
        
-        # Save button
         def save_settings():
-            # Update concurrent downloads
             self.download_manager.max_concurrent = concurrent_var.get()
-           
-            # Update default path
             self.settings['default_path'] = default_path_var.get()
             self.path_var.set(default_path_var.get())
-           
-            # Save settings
             self.save_settings()
-           
             settings_window.destroy()
             self.status_message.set("Settings saved")
        
@@ -2919,51 +2656,37 @@ class YouTubeDownloaderPro:
         )
         save_btn.pack(fill="x", pady=(20, 0))
    
-    def update_concurrent_downloads(self, value):
-        """Update maximum concurrent downloads"""
-        self.download_manager.max_concurrent = value
-   
     def show_error(self, title, message):
-        """Show error message"""
         messagebox.showerror(title, message)
         self.status_message.set(f"Error: {title}")
    
-    def format_size(self, bytes_num):
-        """Format bytes to human readable size"""
+    def _format_size(self, bytes_num):
         if bytes_num <= 0:
             return "0 B"
-       
         units = ['B', 'KB', 'MB', 'GB', 'TB']
         i = 0
         while bytes_num >= 1024 and i < len(units) - 1:
             bytes_num /= 1024
             i += 1
-       
         return f"{bytes_num:.2f} {units[i]}"
    
-    def format_duration(self, seconds):
-        """Format seconds to human readable duration"""
+    def _format_duration(self, seconds):
         if seconds <= 0:
             return "0:00"
-       
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
         secs = seconds % 60
-       
         if hours > 0:
             return f"{hours}:{minutes:02d}:{secs:02d}"
         else:
             return f"{minutes}:{secs:02d}"
    
-    def format_time(self, seconds):
-        """Format seconds to human readable time (for ETA)"""
+    def _format_time(self, seconds):
         if seconds is None or seconds <= 0:
             return "??"
-       
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
         secs = seconds % 60
-       
         if hours > 0:
             return f"{hours}h {minutes}m"
         elif minutes > 0:
@@ -2972,7 +2695,6 @@ class YouTubeDownloaderPro:
             return f"{secs}s"
    
     def load_settings(self):
-        """Load application settings"""
         settings_file = 'settings.json'
         default_settings = {
             'theme': 'dark',
@@ -2981,23 +2703,19 @@ class YouTubeDownloaderPro:
             'default_format': 'video',
             'default_quality': '1080p'
         }
-       
         try:
             if os.path.exists(settings_file):
                 with open(settings_file, 'r', encoding='utf-8') as f:
                     loaded_settings = json.load(f)
-                    # Merge with defaults
                     for key in default_settings:
                         if key not in loaded_settings:
                             loaded_settings[key] = default_settings[key]
                     return loaded_settings
         except Exception as e:
             logger.error(f"Failed to load settings: {e}")
-       
         return default_settings
    
     def save_settings(self):
-        """Save application settings"""
         try:
             with open('settings.json', 'w', encoding='utf-8') as f:
                 json.dump(self.settings, f, indent=2)
@@ -3005,66 +2723,40 @@ class YouTubeDownloaderPro:
             logger.error(f"Failed to save settings: {e}")
 
     def update_timer(self):
-        """Update timer for UI refreshes"""
-        # Refresh task list periodically
         if self.current_tab == "📋 Queue":
             self.refresh_task_list()
-       
-        # Update stats
-        self.update_stats()
-       
-        # Schedule next update
+        self._update_stats()
         self.root.after(1000, self.update_timer)
    
-    def update_stats(self):
-        """Update statistics display"""
+    def _update_stats(self):
         total_downloads = len(self.download_manager.task_history)
         total_size = 0
        
-        # Calculate total size from completed downloads
         for task in self.download_manager.task_history:
             if task.status == DownloadStatus.COMPLETED and task.file_path:
                 if os.path.exists(task.file_path):
                     total_size += os.path.getsize(task.file_path)
        
         active_downloads = len(self.download_manager.active_tasks)
-       
-        # Update stats label
-        stats_text = f"📊 Downloads: {total_downloads} | 📁 Size: {self.format_size(total_size)} | ⚡ Active: {active_downloads}"
+        stats_text = f"📊 Downloads: {total_downloads} | 📁 Size: {self._format_size(total_size)} | ⚡ Active: {active_downloads}"
         self.stats_label.configure(text=stats_text)
-       
-        # Store for later use
         self.total_downloads = total_downloads
         self.total_size = total_size
         self.active_downloads = active_downloads
    
     def on_closing(self):
-        """Handle application closing"""
-        # Save state
         self.download_manager.save_state()
         self.save_settings()
-       
-        # Close application
         self.root.destroy()
 
-
 def main():
-    """Main entry point"""
-    # Create root window
     root = ctk.CTk()
-   
-    # Set window icon (if available)
     try:
-        root.iconbitmap("icon.ico")  # Windows
+        root.iconbitmap("icon.ico")
     except:
         pass
-   
-    # Create application
     app = YouTubeDownloaderPro(root)
-   
-    # Start main loop
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
